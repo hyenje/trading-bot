@@ -37,7 +37,7 @@ General spot live trading is blocked unless `USE_TESTNET=false`, `DRY_RUN=false`
 # Read-only Binance futures testnet check
 ./.venv/bin/python main.py --check-futures
 
-# BTC long/short backtest using LONG_SHORT_ORDER_USDT fixed notional sizing
+# BTC long/short backtest using executor-like fixed notional sizing
 ./.venv/bin/python main.py --backtest-long-short
 
 # Observe long/short signals without futures orders
@@ -87,7 +87,9 @@ No extra test dependency is required.
 
 ## Current Backtest Limits
 
-The long/short backtest now uses `LONG_SHORT_ORDER_USDT` as fixed notional sizing so it is closer to the futures testnet executor than a full-capital simulation. It still does not model funding, slippage, partial fills, latency, liquidation mechanics, or websocket execution timing. Treat good results as observation evidence, not production proof.
+The long/short backtest now uses `LONG_SHORT_ORDER_USDT` as fixed notional sizing, closes and flips on reverse signals by default in `--backtest-long-short`, and prints long-only, short-only, and both-direction results together. The report separates gross PnL, fees, and net PnL, then summarizes exit reasons and holding time. The same command also runs a small fixed set of diagnostics for a stricter long filter, time exits, higher-timeframe trend filtering, EMA gap, and EMA slope.
+
+It still does not model funding, slippage, partial fills, latency, liquidation mechanics, or websocket execution timing. Treat good results as observation evidence, not production proof.
 
 ## Log Hygiene
 

@@ -298,7 +298,9 @@ def run_backtest():
 
 def run_long_short_backtest():
     """BTC 롱/숏 전략 전용 백테스팅 실행"""
-    from exchange import BinanceExchange
+    import ccxt
+
+    from exchange import _maybe_resample_ohlcv, _ohlcv_frame, _source_ohlcv_request
     from backtesting.engine import BacktestEngine
     from strategies import BTCTrendLongShortStrategy
 
@@ -308,11 +310,16 @@ def run_long_short_backtest():
 
     logger.info("BTC 롱/숏 백테스팅 시작...")
     try:
-        exchange = BinanceExchange()
+        df = _fetch_usdm_ohlcv_history(
+            ccxt.binanceusdm,
+            symbol,
+            timeframe,
+            total_limit=5000,
+            helpers=(_source_ohlcv_request, _ohlcv_frame, _maybe_resample_ohlcv),
+        )
     except Exception as e:
-        logger.error(f"BTC 롱/숏 백테스팅 거래소 초기화 실패: {mask_sensitive(e)}")
+        logger.error(f"BTC 롱/숏 백테스팅 데이터 수집 실패: {mask_sensitive(e)}")
         return
-    df = exchange.fetch_ohlcv_history(symbol, timeframe, total_limit=5000)
     if not df.empty and timeframe.endswith("m"):
         latest = df.index[-1]
         close_time = latest.to_pydatetime() + timedelta(minutes=int(timeframe[:-1]))
@@ -326,9 +333,115 @@ def run_long_short_backtest():
     logger.info(f"데이터: {df.index[0]} ~ {df.index[-1]} ({len(df)}봉)")
     logger.info(f"Buy & Hold 수익률: {buy_hold_pct:.2f}%")
     logger.info(f"거래당 명목금액: ${LONG_SHORT_ORDER_USDT:.2f}")
+    logger.info("백테스트 데이터: Binance USD-M Futures public OHLCV")
 
-    strategy = BTCTrendLongShortStrategy(BTCTrendLongShortConfig())
-    result = BacktestEngine(BacktestConfig()).run(
+    base_config = BTCTrendLongShortConfig()
+    scenarios = [
+        ("both / executor-like", base_config, {"allowed_sides": "both"}),
+        ("long-only", base_config, {"allowed_sides": "long"}),
+        ("short-only", base_config, {"allowed_sides": "short"}),
+    ]
+    experiments = [
+        ("exp: long RSI >= 58", _long_short_config(long_rsi_min=58.0), {}),
+        ("exp: max hold 6 bars", base_config, {"max_hold_bars": 6}),
+        ("exp: max hold 12 bars", base_config, {"max_hold_bars": 12}),
+        ("exp: 1h trend filter", base_config, {"higher_timeframe": "1h"}),
+        ("exp: min gap 0.05%", base_config, {"min_trend_gap": 0.0005}),
+        ("exp: min slope 25", base_config, {"min_ema_slope": 25.0}),
+    ]
+
+    rows = []
+    for name, config, options in scenarios + experiments:
+        result = _run_long_short_backtest_case(
+            df,
+            symbol,
+            config,
+            **options,
+        )
+        rows.append((name, result))
+
+    default_result = rows[0][1]
+    logger.info(
+        "기본 executor-like 결과 | 총 거래 %s | 롱 %s | 숏 %s | Net PnL $%.2f",
+        default_result.total_trades,
+        default_result.long_trades,
+        default_result.short_trades,
+        default_result.total_pnl,
+    )
+    print(BacktestEngine.format_result(default_result))
+    print(_format_long_short_backtest_table("방향별 결과", rows[:3]))
+    print(_format_long_short_backtest_table("실험 결과", rows[3:]))
+
+
+def _fetch_usdm_ohlcv_history(
+    exchange_class,
+    symbol: str,
+    timeframe: str,
+    total_limit: int,
+    helpers,
+):
+    source_request, frame_builder, resampler = helpers
+    source_timeframe, source_total_limit, target_rule = source_request(
+        timeframe,
+        total_limit,
+    )
+    exchange = exchange_class(
+        {
+            "enableRateLimit": True,
+            "options": {
+                "fetchCurrencies": False,
+            },
+        }
+    )
+    timeframe_ms = exchange.parse_timeframe(source_timeframe) * 1000
+    since = exchange.milliseconds() - source_total_limit * timeframe_ms
+    rows = []
+
+    while len(rows) < source_total_limit:
+        batch_limit = min(1000, source_total_limit - len(rows))
+        batch = exchange.fetch_ohlcv(
+            symbol,
+            source_timeframe,
+            since=since,
+            limit=batch_limit,
+        )
+        if not batch:
+            break
+        rows.extend(batch)
+        since = batch[-1][0] + timeframe_ms
+        if len(batch) < batch_limit:
+            break
+
+    deduped = []
+    seen = set()
+    for row in rows:
+        if row[0] in seen:
+            continue
+        seen.add(row[0])
+        deduped.append(row)
+
+    df = frame_builder(deduped[-source_total_limit:])
+    return resampler(df, target_rule, total_limit)
+
+
+def _long_short_config(**overrides) -> BTCTrendLongShortConfig:
+    config = BTCTrendLongShortConfig()
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+def _run_long_short_backtest_case(
+    df,
+    symbol: str,
+    config: BTCTrendLongShortConfig,
+    **options,
+):
+    from backtesting.engine import BacktestEngine
+    from strategies import BTCTrendLongShortStrategy
+
+    strategy = BTCTrendLongShortStrategy(config)
+    return BacktestEngine(BacktestConfig()).run(
         df,
         strategy,
         symbol=symbol,
@@ -336,12 +449,37 @@ def run_long_short_backtest():
         take_profit_pct=LONG_SHORT_TAKE_PROFIT_PCT,
         allow_short=True,
         position_size_usdt=LONG_SHORT_ORDER_USDT,
+        flip_on_reverse=True,
+        **options,
     )
 
-    long_count = sum(1 for trade in result.trades if trade.side == "long")
-    short_count = sum(1 for trade in result.trades if trade.side == "short")
-    logger.info(f"롱 거래: {long_count} | 숏 거래: {short_count}")
-    print(BacktestEngine.format_result(result))
+
+def _format_long_short_backtest_table(title: str, rows) -> str:
+    lines = [
+        "",
+        f"--- {title} ---",
+        (
+            "case                         trades long short "
+            "win%   gross    fees     net   med_hold exits"
+        ),
+    ]
+    for name, result in rows:
+        exits = " ".join(
+            f"{key}:{value}" for key, value in result.exit_reason_counts.items()
+        ) or "-"
+        lines.append(
+            f"{name[:28]:<28} "
+            f"{result.total_trades:>6d} "
+            f"{result.long_trades:>4d} "
+            f"{result.short_trades:>5d} "
+            f"{result.win_rate:>5.1f} "
+            f"{result.gross_pnl:>8.2f} "
+            f"{result.total_fees:>7.2f} "
+            f"{result.total_pnl:>7.2f} "
+            f"{result.median_hold_minutes:>8.1f} "
+            f"{exits}"
+        )
+    return "\n".join(lines)
 
 
 def main():

@@ -146,7 +146,9 @@ python main.py --backtest-long-short
 ```
 
 기본 검증값은 10분봉 최대 5000개, 손절 2.0%, 익절 4.0%입니다.
-롱/숏 백테스트는 실제 실행기의 `LONG_SHORT_ORDER_USDT`와 같은 고정 명목금액 기준으로 포지션을 계산합니다.
+롱/숏 백테스트는 실제 실행기의 `LONG_SHORT_ORDER_USDT`와 같은 고정 명목금액 기준으로 포지션을 계산하고, 반대 신호가 나오면 청산 후 즉시 반대 포지션으로 전환하는 executor-like 결과를 기본으로 출력합니다.
+결과에는 both, long-only, short-only 비교와 gross PnL, fee, net PnL, 청산 사유, 보유시간 요약이 함께 표시됩니다.
+같은 명령에서 롱 RSI 필터, 시간 청산, 상위봉 추세 필터, EMA gap, EMA slope 실험도 고정 비교표로 확인할 수 있습니다.
 파라미터는 `.env`에서 `BTC_LS_FAST_EMA`, `BTC_LS_SLOW_EMA`, `BTC_LS_RSI_PERIOD` 등으로 조정할 수 있습니다.
 실제 주문 없이 현재 신호와 최근 롱/숏 신호를 보려면 `--observe-long-short`를 실행하세요.
 
