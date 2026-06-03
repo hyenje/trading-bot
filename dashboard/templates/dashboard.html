@@ -64,6 +64,8 @@
         .tag-hold { background: rgba(88,166,255,0.15); color: #58a6ff; }
         .tag-short { background: rgba(248,81,73,0.15); color: #f85149; }
         .tag-long { background: rgba(63,185,80,0.15); color: #3fb950; }
+        .tag-wait-long { background: rgba(63,185,80,0.10); color: #7ee787; }
+        .tag-wait-short { background: rgba(248,81,73,0.10); color: #ff7b72; }
         .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
         .signal-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 24px; }
         .signal-reason { margin-top: 10px; color: #8b949e; line-height: 1.45; font-size: 0.9em; }
@@ -233,12 +235,16 @@
         function sideClass(side) {
             if (side === 'LONG') return 'tag-long';
             if (side === 'SHORT') return 'tag-short';
+            if (side === 'WAIT_LONG_BIAS') return 'tag-wait-long';
+            if (side === 'WAIT_SHORT_BIAS') return 'tag-wait-short';
             return 'tag-hold';
         }
 
         function sideLabel(side) {
             if (side === 'LONG') return 'LONG';
             if (side === 'SHORT') return 'SHORT';
+            if (side === 'WAIT_LONG_BIAS') return 'WAIT_LONG_BIAS';
+            if (side === 'WAIT_SHORT_BIAS') return 'WAIT_SHORT_BIAS';
             return 'HOLD';
         }
 
@@ -246,6 +252,14 @@
             if (bias === 'LONG_BIAS') return 'LONG';
             if (bias === 'SHORT_BIAS') return 'SHORT';
             return 'NEUTRAL';
+        }
+
+        function signalDisplaySide(signal) {
+            const side = signal.side || 'HOLD';
+            if (side !== 'HOLD') return side;
+            if (signal.bias === 'LONG_BIAS') return 'WAIT_LONG_BIAS';
+            if (signal.bias === 'SHORT_BIAS') return 'WAIT_SHORT_BIAS';
+            return side;
         }
 
         function renderLongShortSignal(signal) {
@@ -260,7 +274,7 @@
             section.style.display = 'grid';
             recentCard.style.display = 'block';
 
-            const side = signal.side || 'HOLD';
+            const side = signalDisplaySide(signal);
             const sideEl = document.getElementById('signal-side');
             sideEl.innerHTML = `<span class="tag ${sideClass(side)}">${sideLabel(side)}</span>`;
             document.getElementById('signal-reason').textContent = signal.reason || '-';
@@ -322,7 +336,7 @@
             statusTable.innerHTML = `<tr>
                 <td><span class="tag ${status.enabled ? 'tag-long' : 'tag-hold'}">${status.enabled ? 'ON' : 'OFF'}</span></td>
                 <td><span class="tag ${marketClass}">${marketState}</span><br><span class="muted">${status.last_market_update_at || '-'}</span></td>
-                <td>${status.timeframe || '-'} / ${Number(status.poll_interval || 0)}s</td>
+                <td>${status.timeframe || '-'} / ${Number(status.poll_interval || 0)}s${status.signal_catchup_enabled ? ' · catch-up' : ''}</td>
                 <td>${Number(status.risk_poll_interval || 0)}s</td>
                 <td>${protectionCount}</td>
                 <td>${safetyText}</td>

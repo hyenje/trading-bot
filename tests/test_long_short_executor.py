@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 from config import LONG_SHORT_MAX_CONSECUTIVE_LOSSES, LONG_SHORT_MAX_DAILY_TRADES
@@ -302,6 +302,69 @@ class LongShortExecutorTest(unittest.TestCase):
         self.assertEqual(executor._last_position["entry_price"], 100.0)
         self.assertEqual(executor._market_state_status, "rate_limited")
         self.assertEqual(exchange.actions, [])
+
+    def test_recent_signal_catchup_promotes_matching_fresh_signal_when_enabled(self):
+        exchange = FakeFuturesExchange()
+        executor = make_executor(exchange)
+        signal_time = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+        payload = {
+            "signal": "HOLD",
+            "side": "HOLD",
+            "bias": "LONG_BIAS",
+            "confidence": 0.0,
+            "price": 101.0,
+            "reason": "전환 없음",
+            "updated_at": datetime.utcnow().isoformat(),
+            "recent_signals": [
+                {
+                    "time": signal_time,
+                    "signal": "BUY",
+                    "side": "LONG",
+                    "price": 100.0,
+                    "confidence": 0.8,
+                    "reason": "recent long",
+                }
+            ],
+        }
+
+        with patch("long_short_executor.LONG_SHORT_ENABLE_SIGNAL_CATCHUP", True):
+            catchup = executor._signal_payload_for_entry(
+                payload,
+                exchange.fetch_position("BTC/USDT"),
+            )
+
+        self.assertEqual(catchup["side"], "LONG")
+        self.assertTrue(catchup["catchup"])
+        self.assertEqual(catchup["updated_at"], signal_time)
+        self.assertIn("최근 신호 따라잡기", catchup["reason"])
+
+    def test_recent_signal_catchup_ignores_mismatched_bias(self):
+        exchange = FakeFuturesExchange()
+        executor = make_executor(exchange)
+        payload = {
+            "signal": "HOLD",
+            "side": "HOLD",
+            "bias": "SHORT_BIAS",
+            "updated_at": datetime.utcnow().isoformat(),
+            "recent_signals": [
+                {
+                    "time": (datetime.utcnow() - timedelta(minutes=5)).isoformat(),
+                    "signal": "BUY",
+                    "side": "LONG",
+                    "price": 100.0,
+                    "confidence": 0.8,
+                    "reason": "recent long",
+                }
+            ],
+        }
+
+        with patch("long_short_executor.LONG_SHORT_ENABLE_SIGNAL_CATCHUP", True):
+            catchup = executor._signal_payload_for_entry(
+                payload,
+                exchange.fetch_position("BTC/USDT"),
+            )
+
+        self.assertIs(catchup, payload)
 
     def test_daily_loss_limit_closes_open_position(self):
         exchange = FakeFuturesExchange(side="long", unrealized_pnl=-60.0)

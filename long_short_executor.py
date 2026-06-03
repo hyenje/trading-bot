@@ -16,6 +16,7 @@ from config import (
     BTCTrendLongShortConfig,
     DRY_RUN,
     LONG_SHORT_COOLDOWN_AFTER_LOSSES_MINUTES,
+    LONG_SHORT_ENABLE_SIGNAL_CATCHUP,
     LONG_SHORT_LEVERAGE,
     LONG_SHORT_MAX_CONSECUTIVE_LOSSES,
     LONG_SHORT_MAX_DAILY_LOSS_PCT,
@@ -131,6 +132,7 @@ class BTCLongShortExecutor:
                 "leverage": LONG_SHORT_LEVERAGE,
                 "poll_interval": LONG_SHORT_POLL_INTERVAL,
                 "risk_poll_interval": LONG_SHORT_RISK_POLL_INTERVAL,
+                "signal_catchup_enabled": LONG_SHORT_ENABLE_SIGNAL_CATCHUP,
                 "stop_loss_pct": LONG_SHORT_STOP_LOSS_PCT,
                 "take_profit_pct": LONG_SHORT_TAKE_PROFIT_PCT,
                 "last_action": last_action,
@@ -224,6 +226,11 @@ class BTCLongShortExecutor:
         if self._exit_for_risk(position, signal_payload):
             return
 
+        signal_payload = self._signal_payload_for_entry(signal_payload, position)
+        if signal_payload["side"] in {"LONG", "SHORT"}:
+            action = "최근 신호 따라잡기" if signal_payload.get("catchup") else "신호 관찰"
+            self._set_status(signal_payload, action)
+
         side = signal_payload["side"]
         if side not in {"LONG", "SHORT"}:
             return
@@ -237,6 +244,49 @@ class BTCLongShortExecutor:
 
         self._execute_side(side, signal_payload, position=position)
         self._last_signal_key = signal_key
+
+    def _signal_payload_for_entry(
+        self, signal_payload: Dict[str, Any], position: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if not LONG_SHORT_ENABLE_SIGNAL_CATCHUP:
+            return signal_payload
+        if signal_payload.get("side") in {"LONG", "SHORT"}:
+            return signal_payload
+        if position.get("side") != "flat":
+            return signal_payload
+
+        recent_signal = self._latest_recent_signal(
+            signal_payload.get("recent_signals", [])
+        )
+        if not recent_signal:
+            return signal_payload
+
+        recent_side = recent_signal.get("side")
+        if recent_side not in {"LONG", "SHORT"}:
+            return signal_payload
+        if self._bias_side(signal_payload.get("bias")) != recent_side:
+            return signal_payload
+        if self._is_stale(recent_signal.get("time", "")):
+            return signal_payload
+
+        catchup_payload = dict(signal_payload)
+        catchup_payload.update(
+            {
+                "signal": recent_signal.get("signal", signal_payload.get("signal")),
+                "side": recent_side,
+                "confidence": recent_signal.get(
+                    "confidence", signal_payload.get("confidence", 0.0)
+                ),
+                "price": recent_signal.get("price", signal_payload.get("price", 0.0)),
+                "reason": f"최근 신호 따라잡기: {recent_signal.get('reason', '-')}",
+                "updated_at": recent_signal.get(
+                    "time", signal_payload.get("updated_at")
+                ),
+                "catchup": True,
+                "source_signal_time": recent_signal.get("time"),
+            }
+        )
+        return catchup_payload
 
     def _execute_side(
         self,
@@ -946,6 +996,20 @@ class BTCLongShortExecutor:
             return True
         age = (datetime.utcnow() - signal_time).total_seconds() / 60
         return age > LONG_SHORT_MAX_SIGNAL_AGE_MINUTES
+
+    @staticmethod
+    def _latest_recent_signal(signals: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not signals:
+            return None
+        return max(signals, key=lambda signal: signal.get("time", ""))
+
+    @staticmethod
+    def _bias_side(bias: Optional[str]) -> str:
+        if bias == "LONG_BIAS":
+            return "LONG"
+        if bias == "SHORT_BIAS":
+            return "SHORT"
+        return "HOLD"
 
     def _closed_candles(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:

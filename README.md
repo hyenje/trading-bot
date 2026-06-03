@@ -54,7 +54,14 @@ http://127.0.0.1:5001
 http://127.0.0.1:5001/api/status
 ```
 
-The dashboard distinguishes signal bias from actual positions. `HOLD` plus `LONG_BIAS` or `SHORT_BIAS` is not an open position.
+The dashboard distinguishes signal bias from actual positions. A strategy-side
+`HOLD` with `LONG_BIAS` or `SHORT_BIAS` is displayed as `WAIT_LONG_BIAS` or
+`WAIT_SHORT_BIAS`; it is still not an open position.
+
+If `LONG_SHORT_ENABLE_SIGNAL_CATCHUP=true`, the futures testnet executor may
+enter on the latest recent signal after a restart, but only when the account is
+flat, the signal is within `LONG_SHORT_MAX_SIGNAL_AGE_MINUTES`, and the current
+bias still points in the same direction. The default is `false`.
 
 ## Running In A Screen Session
 

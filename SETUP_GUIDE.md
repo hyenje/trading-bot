@@ -165,6 +165,8 @@ ENABLE_LONG_SHORT_EXECUTION=true
 기본 봉은 `LONG_SHORT_TIMEFRAME=10m`, 주문 판단 주기는 `LONG_SHORT_POLL_INTERVAL=600`입니다.
 리스크 감시는 `LONG_SHORT_RISK_POLL_INTERVAL=180`으로 별도 실행됩니다.
 기본 주문 금액은 `LONG_SHORT_ORDER_USDT=25`, 기본 레버리지는 `LONG_SHORT_LEVERAGE=1`입니다.
+대시보드의 `WAIT_LONG_BIAS` / `WAIT_SHORT_BIAS`는 현재 추세 편향을 보여주는 대기 상태이며, 실제 포지션 진입 신호와는 구분됩니다.
+재시작 직후 최근 신호를 따라잡아 테스트넷 진입까지 허용하려면 `LONG_SHORT_ENABLE_SIGNAL_CATCHUP=true`를 설정하세요. 이 경우에도 flat 상태, 같은 방향 bias, `LONG_SHORT_MAX_SIGNAL_AGE_MINUTES` 이내 신호일 때만 작동합니다.
 Futures 실행기는 진입 직후 `STOP_MARKET`/`TAKE_PROFIT_MARKET` reduce-only 보호 주문을 거래소에 생성합니다.
 거래소 조회 실패나 rate limit이 감지되면 신규 진입은 차단되고, 마지막으로 확인된 포지션 상태를 `flat`으로 덮어쓰지 않습니다.
 포지션 보유 중에는 봇 내부 손절/익절 조건도 보조로 확인한 뒤 새 롱/숏 신호를 처리합니다.
