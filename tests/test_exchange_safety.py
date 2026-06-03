@@ -4,7 +4,13 @@ from unittest.mock import patch
 import config
 import pandas as pd
 
-from exchange import BinanceExchange, _maybe_resample_ohlcv, _ohlcv_frame, _source_ohlcv_request
+from exchange import (
+    BinanceExchange,
+    BinanceFuturesExchange,
+    _maybe_resample_ohlcv,
+    _ohlcv_frame,
+    _source_ohlcv_request,
+)
 
 
 class FakeCcxtExchange:
@@ -107,6 +113,19 @@ class ExchangeSafetyTest(unittest.TestCase):
                 BinanceExchange()
 
             binance.assert_not_called()
+
+    def test_futures_exchange_uses_usdm_client(self):
+        with patch("exchange.USE_TESTNET", True), patch(
+            "exchange.ccxt.binanceusdm"
+        ) as binanceusdm, patch("exchange.ccxt.binance") as binance:
+            instance = binanceusdm.return_value
+
+            exchange = BinanceFuturesExchange()
+
+        self.assertIs(exchange.exchange, instance)
+        instance.set_sandbox_mode.assert_called_once_with(True)
+        instance.load_markets.assert_called_once_with()
+        binance.assert_not_called()
 
     def test_mask_sensitive_redacts_configured_secrets(self):
         with patch("config.BINANCE_API_KEY", "abc123"), patch(

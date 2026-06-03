@@ -425,7 +425,7 @@ class BinanceFuturesExchange:
             params["apiKey"] = BINANCE_FUTURES_API_KEY
             params["secret"] = BINANCE_FUTURES_API_SECRET
 
-        self.exchange = ccxt.binance(params)
+        self.exchange = ccxt.binanceusdm(params)
         self.exchange.set_sandbox_mode(True)
         logger.info("Futures 테스트넷 모드로 연결됨")
         self.exchange.load_markets()
