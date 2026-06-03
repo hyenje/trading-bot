@@ -1,0 +1,9 @@
+.env
+*.log
+logs/
+.venv/
+.playwright-cli/
+output/
+__pycache__/
+*.py[cod]
+.DS_Store
