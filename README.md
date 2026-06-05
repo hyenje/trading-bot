@@ -109,6 +109,11 @@ The active baseline exit profile is `LONG_SHORT_STOP_LOSS_PCT=2.0`,
 `LONG_SHORT_BREAK_EVEN_AFTER_PCT=0.0`; `0` disables the optional time-exit and
 break-even exits.
 
+`python main.py --backtest-regime-pullback` runs a separate backtest-only
+experiment that classifies the 4h market as trend or range, then compares
+15m/1h RSI + Bollinger pullback or mean-reversion entries against the current
+baseline. It does not change the running Futures testnet executor.
+
 It still does not model funding, dynamic order-book slippage, partial fills,
 latency, liquidation mechanics, or websocket execution timing. Treat good
 results as observation evidence, not production proof, especially while the

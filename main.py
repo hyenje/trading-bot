@@ -17,6 +17,7 @@ from typing import Optional
 from utils.logger import setup_logger
 from config import (
     BacktestConfig,
+    BTCRegimePullbackConfig,
     BTCTrendLongShortConfig,
     BollingerConfig,
     BINANCE_API_KEY,
@@ -53,6 +54,11 @@ def parse_args():
         "--backtest-long-short",
         action="store_true",
         help="BTC 롱/숏 전략 백테스팅 실행",
+    )
+    mode_group.add_argument(
+        "--backtest-regime-pullback",
+        action="store_true",
+        help="BTC 4h regime + RSI/BB pullback 전략 백테스팅 실행",
     )
     mode_group.add_argument(
         "--observe-long-short",
@@ -402,6 +408,110 @@ def run_long_short_backtest():
         )
 
 
+def run_regime_pullback_backtest():
+    """BTC 4h regime + 15m/1h RSI/BB pullback 전략 백테스팅 실행"""
+    import ccxt
+
+    from exchange import _maybe_resample_ohlcv, _ohlcv_frame, _source_ohlcv_request
+    from backtesting.engine import BacktestEngine
+    from strategies import BTCRegimePullbackStrategy
+
+    logger = logging.getLogger(__name__)
+    symbol = "BTC/USDT"
+    days = 365
+    helpers = (_source_ohlcv_request, _ohlcv_frame, _maybe_resample_ohlcv)
+
+    logger.info("BTC regime pullback 백테스팅 시작...")
+    baseline_df = _fetch_closed_usdm_ohlcv(
+        ccxt.binanceusdm,
+        symbol,
+        LONG_SHORT_TIMEFRAME,
+        days,
+        helpers,
+    )
+    if baseline_df.empty:
+        logger.warning(f"{symbol} baseline 데이터 수집 실패")
+        return
+
+    baseline_config = BTCTrendLongShortConfig()
+    baseline_options = {
+        "regime_timeframe": LONG_SHORT_REGIME_TIMEFRAME,
+        "require_regime_alignment": LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+        "reverse_only_when_profitable": LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE,
+        "min_reverse_net_pnl_usdt": LONG_SHORT_MIN_REVERSE_NET_PNL_USDT,
+        "max_hold_bars": LONG_SHORT_MAX_HOLD_BARS,
+        "break_even_after_pct": LONG_SHORT_BREAK_EVEN_AFTER_PCT,
+    }
+    rows = [
+        (
+            "baseline 10m EMA/4h",
+            _run_precomputed_long_short_backtest_case(
+                baseline_df,
+                symbol,
+                baseline_config,
+                **baseline_options,
+            ),
+        )
+    ]
+    datasets = {"baseline": baseline_df}
+
+    for entry_timeframe in ("15m", "1h"):
+        df = _fetch_closed_usdm_ohlcv(
+            ccxt.binanceusdm,
+            symbol,
+            entry_timeframe,
+            days,
+            helpers,
+        )
+        if df.empty:
+            logger.warning(f"{entry_timeframe} 데이터 수집 실패")
+            continue
+        datasets[entry_timeframe] = df
+        logger.info(
+            "%s 데이터: %s ~ %s (%s봉), B&H %.2f%%",
+            entry_timeframe,
+            df.index[0],
+            df.index[-1],
+            len(df),
+            _buy_hold_pct(df),
+        )
+        for mode, label in (
+            ("trend", f"trend-pullback {entry_timeframe}"),
+            ("range", f"range-meanrev {entry_timeframe}"),
+            ("combined", f"combined {entry_timeframe}"),
+        ):
+            config = BTCRegimePullbackConfig(
+                mode=mode,
+                entry_timeframe=entry_timeframe,
+            )
+            rows.append(
+                (
+                    label,
+                    _run_regime_pullback_backtest_case(
+                        df,
+                        symbol,
+                        BTCRegimePullbackStrategy(config),
+                        config,
+                    ),
+                )
+            )
+
+    print(_format_execution_assumptions())
+    print(_format_regime_pullback_assumptions(days))
+    print(_format_long_short_backtest_table("Regime pullback 비교", rows))
+
+    candidates = rows[1:]
+    best_name, best_result = max(
+        candidates or rows,
+        key=lambda item: item[1].total_pnl,
+    )
+    print(f"\nBest candidate by net PnL: {best_name}")
+    print(BacktestEngine.format_result(best_result))
+    print(_format_period_trade_breakdown(best_result))
+    print(_format_trade_distribution(best_result))
+    print(_format_regime_pullback_oos_table(datasets, symbol))
+
+
 def _fetch_usdm_ohlcv_history(
     exchange_class,
     symbol: str,
@@ -453,6 +563,23 @@ def _fetch_usdm_ohlcv_history(
     return resampler(df, target_rule, total_limit)
 
 
+def _fetch_closed_usdm_ohlcv(
+    exchange_class,
+    symbol: str,
+    timeframe: str,
+    days: int,
+    helpers,
+):
+    df = _fetch_usdm_ohlcv_history(
+        exchange_class,
+        symbol,
+        timeframe,
+        total_limit=_bars_for_timeframe(timeframe, days),
+        helpers=helpers,
+    )
+    return _drop_open_candle(df, timeframe)
+
+
 def _long_short_config(**overrides) -> BTCTrendLongShortConfig:
     config = BTCTrendLongShortConfig()
     for key, value in overrides.items():
@@ -487,6 +614,178 @@ def _run_long_short_backtest_case(
     )
 
 
+def _run_regime_pullback_backtest_case(
+    df,
+    symbol: str,
+    strategy,
+    config: BTCRegimePullbackConfig,
+    backtest_config=None,
+):
+    from backtesting.engine import BacktestEngine
+
+    precomputed = _precompute_regime_pullback_strategy(df, symbol, strategy)
+    return BacktestEngine(backtest_config or BacktestConfig()).run(
+        df,
+        precomputed,
+        symbol=symbol,
+        stop_loss_pct=config.trend_stop_loss_pct,
+        take_profit_pct=config.trend_take_profit_pct,
+        allow_short=True,
+        position_size_usdt=LONG_SHORT_ORDER_USDT,
+        flip_on_reverse=True,
+        max_hold_bars=0,
+        reverse_only_when_profitable=LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE,
+        min_reverse_net_pnl_usdt=LONG_SHORT_MIN_REVERSE_NET_PNL_USDT,
+    )
+
+
+def _run_precomputed_long_short_backtest_case(
+    df,
+    symbol: str,
+    config: BTCTrendLongShortConfig,
+    backtest_config=None,
+    **options,
+):
+    from backtesting.engine import BacktestEngine
+
+    strategy = _precompute_btc_trend_strategy(df, symbol, config)
+    run_options = dict(options)
+    stop_loss_pct = run_options.pop("stop_loss_pct", LONG_SHORT_STOP_LOSS_PCT)
+    take_profit_pct = run_options.pop("take_profit_pct", LONG_SHORT_TAKE_PROFIT_PCT)
+    return BacktestEngine(backtest_config or BacktestConfig()).run(
+        df,
+        strategy,
+        symbol=symbol,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        allow_short=True,
+        position_size_usdt=LONG_SHORT_ORDER_USDT,
+        flip_on_reverse=True,
+        **run_options,
+    )
+
+
+def _precompute_btc_trend_strategy(
+    df,
+    symbol: str,
+    config: BTCTrendLongShortConfig,
+):
+    from strategies import BTCTrendLongShortStrategy, Signal, TradeSignal
+
+    strategy = BTCTrendLongShortStrategy(config)
+    indicators = strategy.get_indicators(df)
+    signals = {}
+    min_rows = max(config.slow_ema, config.rsi_period) + config.slope_period + 2
+    for index in range(len(indicators)):
+        current = indicators.iloc[index]
+        price = float(current["close"])
+        if symbol != "BTC/USDT" or index + 1 < min_rows or index == 0:
+            signals[indicators.index[index]] = TradeSignal(
+                signal=Signal.HOLD,
+                symbol=symbol,
+                strategy_name=strategy.name,
+                confidence=0.0,
+                price=price,
+                reason="데이터 부족",
+            )
+            continue
+
+        previous = indicators.iloc[index - 1]
+        cross_up = (
+            previous["ema_fast"] <= previous["ema_slow"]
+            and current["ema_fast"] > current["ema_slow"]
+        )
+        cross_down = (
+            previous["ema_fast"] >= previous["ema_slow"]
+            and current["ema_fast"] < current["ema_slow"]
+        )
+        bullish = current["ema_slope"] > 0 and current["rsi"] >= config.long_rsi_min
+        bearish = current["ema_slope"] < 0 and current["rsi"] <= config.short_rsi_max
+        confidence = strategy._confidence(current)
+
+        if cross_up and bullish and confidence >= config.min_confidence:
+            signal = Signal.BUY
+            reason = (
+                f"BTC 롱: EMA{config.fast_ema}/{config.slow_ema} 상향 전환, "
+                f"RSI {current['rsi']:.1f}, slope {current['ema_slope']:.2f}"
+            )
+            metadata = strategy._metadata(current, "long")
+        elif cross_down and bearish and confidence >= config.min_confidence:
+            signal = Signal.SELL
+            reason = (
+                f"BTC 숏: EMA{config.fast_ema}/{config.slow_ema} 하향 전환, "
+                f"RSI {current['rsi']:.1f}, slope {current['ema_slope']:.2f}"
+            )
+            metadata = strategy._metadata(current, "short")
+        else:
+            signal = Signal.HOLD
+            confidence = 0.0
+            reason = f"전환 없음: RSI {current['rsi']:.1f}, gap {current['trend_gap']:.3%}"
+            metadata = None
+
+        signals[indicators.index[index]] = TradeSignal(
+            signal=signal,
+            symbol=symbol,
+            strategy_name=strategy.name,
+            confidence=confidence,
+            price=price,
+            reason=reason,
+            metadata=metadata,
+        )
+    return _PrecomputedSignalStrategy(strategy.name, indicators, signals, config)
+
+
+def _precompute_regime_pullback_strategy(df, symbol: str, strategy):
+    from strategies import Signal, TradeSignal
+
+    indicators = strategy.get_indicators(df)
+    signals = {}
+    min_rows = max(strategy.config.bb_period, strategy.config.rsi_period) + 2
+    for index in range(len(indicators)):
+        current = indicators.iloc[index]
+        price = float(current["close"])
+        if index + 1 < min_rows or index == 0:
+            signal = TradeSignal(
+                signal=Signal.HOLD,
+                symbol=symbol,
+                strategy_name=strategy.name,
+                confidence=0.0,
+                price=price,
+                reason="데이터 부족",
+            )
+        else:
+            signal = strategy.analyze_rows(current, indicators.iloc[index - 1], symbol)
+        signals[indicators.index[index]] = signal
+    return _PrecomputedSignalStrategy(strategy.name, indicators, signals, strategy.config)
+
+
+class _PrecomputedSignalStrategy:
+    def __init__(self, name: str, indicators, signals, config=None):
+        self.name = name
+        self.indicators = indicators
+        self.signals = signals
+        self.config = config
+
+    def analyze(self, df, symbol: str):
+        from strategies import Signal, TradeSignal
+
+        timestamp = df.index[-1]
+        signal = self.signals.get(timestamp)
+        if signal:
+            return signal
+        return TradeSignal(
+            signal=Signal.HOLD,
+            symbol=symbol,
+            strategy_name=self.name,
+            confidence=0.0,
+            price=float(df["close"].iloc[-1]),
+            reason="precomputed signal 없음",
+        )
+
+    def get_indicators(self, df):
+        return self.indicators.reindex(df.index)
+
+
 def _backtest_config(**overrides) -> BacktestConfig:
     config = BacktestConfig()
     for key, value in overrides.items():
@@ -504,7 +803,7 @@ def _format_execution_assumptions() -> str:
             f"fixed_notional=${LONG_SHORT_ORDER_USDT:.2f}",
             (
                 "reverse_guard="
-            f"{'fee-aware profitable only' if LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE else 'raw reverse'}"
+                f"{'fee-aware profitable only' if LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE else 'raw reverse'}"
             ),
             f"exit=tp {LONG_SHORT_TAKE_PROFIT_PCT:.2f}% / sl {LONG_SHORT_STOP_LOSS_PCT:.2f}%",
             (
@@ -515,6 +814,47 @@ def _format_execution_assumptions() -> str:
             "unmodeled=funding partial_fills latency liquidation websocket_timing",
         ]
     )
+
+
+def _format_regime_pullback_assumptions(days: int) -> str:
+    return "\n".join(
+        [
+            "",
+            "--- Regime pullback 설정 ---",
+            f"lookback_days={days}",
+            "regime=4h EMA12/26 gap>=0.30% with closed candles only",
+            "entries=15m and 1h RSI14 + BB20/2.0",
+            "trend_exit=SL 1.0% / TP 1.5% / no time exit",
+            "range_exit=SL 0.8% / TP 1.0% / max_hold 12 entry bars",
+            "runtime_status=backtest-only; testnet executor unchanged",
+        ]
+    )
+
+
+def _format_regime_pullback_oos_table(datasets, symbol: str) -> str:
+    rows = []
+    from strategies import BTCRegimePullbackStrategy
+
+    for entry_timeframe in ("15m", "1h"):
+        df = datasets.get(entry_timeframe)
+        if df is None or df.empty:
+            continue
+        windows = _equal_time_windows(df, 3, min_rows=90)
+        for index, window in enumerate(windows, start=1):
+            config = BTCRegimePullbackConfig(
+                mode="combined",
+                entry_timeframe=entry_timeframe,
+            )
+            result = _run_regime_pullback_backtest_case(
+                window,
+                symbol,
+                BTCRegimePullbackStrategy(config),
+                config,
+            )
+            rows.append((f"combined {entry_timeframe} OOS {index}", window, result))
+    if not rows:
+        return "\n--- Regime pullback OOS ---\n데이터가 부족해 생략"
+    return _format_window_result_table("Regime pullback OOS", rows)
 
 
 def _format_cost_scenarios(
@@ -791,6 +1131,46 @@ def _bars_per_day() -> int:
     return 24
 
 
+def _bars_for_timeframe(timeframe: str, days: int) -> int:
+    if timeframe.endswith("m"):
+        minutes = int(timeframe[:-1])
+        return max(1, days * 24 * 60 // minutes)
+    if timeframe.endswith("h"):
+        hours = int(timeframe[:-1])
+        return max(1, days * 24 // hours)
+    if timeframe.endswith("d"):
+        return max(1, days // int(timeframe[:-1]))
+    return days * 24
+
+
+def _drop_open_candle(df, timeframe: str):
+    if df.empty:
+        return df
+    seconds = _timeframe_seconds(timeframe)
+    if seconds <= 0:
+        return df
+    latest = df.index[-1]
+    close_time = latest.to_pydatetime() + timedelta(seconds=seconds)
+    if datetime.utcnow() < close_time:
+        return df.iloc[:-1]
+    return df
+
+
+def _timeframe_seconds(timeframe: str) -> int:
+    unit = timeframe[-1]
+    try:
+        value = int(timeframe[:-1])
+    except ValueError:
+        return 0
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 60 * 60
+    if unit == "d":
+        return value * 24 * 60 * 60
+    return 0
+
+
 def _avg(values) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -863,6 +1243,8 @@ def main():
         raise SystemExit(0 if run_futures_check() else 1)
     elif args.backtest_long_short:
         run_long_short_backtest()
+    elif args.backtest_regime_pullback:
+        run_regime_pullback_backtest()
     elif args.trade_long_short:
         run_long_short_trader()
     elif args.observe_long_short:

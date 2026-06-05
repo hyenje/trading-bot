@@ -145,6 +145,12 @@ Spot 봇에는 숏 주문을 연결하지 않았고, Futures 테스트넷 실행
 python main.py --backtest-long-short
 ```
 
+4시간봉 추세/박스권을 먼저 나누고 15분봉/1시간봉 RSI + 볼린저 밴드 눌림·평균회귀 진입을 실험하려면 아래 명령을 사용합니다. 이 경로는 백테스트 전용이며 Futures 테스트넷 실행기에는 연결하지 않습니다.
+
+```bash
+python main.py --backtest-regime-pullback
+```
+
 기본 검증값은 10분봉 최대 5000개, 손절 2.0%, 익절 4.0%입니다.
 `LONG_SHORT_MAX_HOLD_BARS=0`, `LONG_SHORT_BREAK_EVEN_AFTER_PCT=0.0`이면 시간청산과 본전스탑은 꺼집니다.
 롱/숏 백테스트는 실제 실행기의 `LONG_SHORT_ORDER_USDT`와 같은 고정 명목금액 기준으로 포지션을 계산합니다.

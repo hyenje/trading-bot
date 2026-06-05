@@ -39,6 +39,9 @@ class Trade:
     reason_entry: str = ""
     reason_exit: str = ""
     break_even_armed: bool = False
+    exit_stop_loss_pct: Optional[float] = None
+    exit_take_profit_pct: Optional[float] = None
+    exit_max_hold_bars: Optional[int] = None
 
 
 @dataclass
@@ -201,7 +204,9 @@ class BacktestEngine:
                 low = window["low"].iloc[-1]
 
                 if self.position.side == "long":
-                    sl_price = entry * (1 - stop_loss_pct / 100)
+                    trade_stop_loss_pct = self._position_stop_loss_pct(stop_loss_pct)
+                    trade_take_profit_pct = self._position_take_profit_pct(take_profit_pct)
+                    sl_price = entry * (1 - trade_stop_loss_pct / 100)
                     if not self.position.break_even_armed and low <= sl_price:
                         self._close_position(sl_price, current_time, "손절")
                         self._update_equity(current_price, current_time)
@@ -215,13 +220,15 @@ class BacktestEngine:
                         self._update_equity(current_price, current_time)
                         continue
 
-                    tp_price = entry * (1 + take_profit_pct / 100)
+                    tp_price = entry * (1 + trade_take_profit_pct / 100)
                     if high >= tp_price:
                         self._close_position(tp_price, current_time, "익절")
                         self._update_equity(current_price, current_time)
                         continue
                 else:
-                    sl_price = entry * (1 + stop_loss_pct / 100)
+                    trade_stop_loss_pct = self._position_stop_loss_pct(stop_loss_pct)
+                    trade_take_profit_pct = self._position_take_profit_pct(take_profit_pct)
+                    sl_price = entry * (1 + trade_stop_loss_pct / 100)
                     if not self.position.break_even_armed and high >= sl_price:
                         self._close_position(sl_price, current_time, "숏 손절")
                         self._update_equity(current_price, current_time)
@@ -235,16 +242,16 @@ class BacktestEngine:
                         self._update_equity(current_price, current_time)
                         continue
 
-                    tp_price = entry * (1 - take_profit_pct / 100)
+                    tp_price = entry * (1 - trade_take_profit_pct / 100)
                     if low <= tp_price:
                         self._close_position(tp_price, current_time, "숏 익절")
                         self._update_equity(current_price, current_time)
                         continue
 
                 if (
-                    max_hold_bars is not None
-                    and max_hold_bars > 0
-                    and i - self.position.entry_index >= max_hold_bars
+                    self._position_max_hold_bars(max_hold_bars) is not None
+                    and i - self.position.entry_index
+                    >= self._position_max_hold_bars(max_hold_bars)
                 ):
                     self._close_position(current_price, current_time, "시간 청산")
                     self._update_equity(current_price, current_time)
@@ -276,6 +283,7 @@ class BacktestEngine:
                             strategy.name,
                             signal.reason,
                             side="long",
+                            metadata=signal.metadata,
                         )
                 elif self.position.side == "short":
                     if self._blocks_reverse_close(current_price):
@@ -294,6 +302,7 @@ class BacktestEngine:
                             strategy.name,
                             signal.reason,
                             side="long",
+                            metadata=signal.metadata,
                         )
             elif signal.signal == Signal.SELL:
                 if self.position and self.position.side == "long":
@@ -313,6 +322,7 @@ class BacktestEngine:
                             strategy.name,
                             signal.reason,
                             side="short",
+                            metadata=signal.metadata,
                         )
                 elif not self.position and self._can_open_side(
                     strategy, window, "short", allow_short
@@ -325,6 +335,7 @@ class BacktestEngine:
                         strategy.name,
                         signal.reason,
                         side="short",
+                        metadata=signal.metadata,
                     )
 
             self._update_equity(current_price, current_time)
@@ -346,6 +357,7 @@ class BacktestEngine:
         strategy: str,
         reason: str,
         side: str = "long",
+        metadata: Optional[dict] = None,
     ):
         entry_price = self._entry_fill_price(price, side)
 
@@ -370,6 +382,9 @@ class BacktestEngine:
             entry_index=index,
             strategy=strategy,
             reason_entry=reason,
+            exit_stop_loss_pct=self._metadata_float(metadata, "exit_stop_loss_pct"),
+            exit_take_profit_pct=self._metadata_float(metadata, "exit_take_profit_pct"),
+            exit_max_hold_bars=self._metadata_int(metadata, "exit_max_hold_bars"),
         )
         logger.debug(f"{side} 포지션 진입: {entry_price:.2f} at {time}")
 
@@ -516,6 +531,42 @@ class BacktestEngine:
         if self.position.side == "long":
             return high >= entry * (1 + self.break_even_after_pct / 100)
         return low <= entry * (1 - self.break_even_after_pct / 100)
+
+    def _position_stop_loss_pct(self, default: float) -> float:
+        if self.position and self.position.exit_stop_loss_pct is not None:
+            return self.position.exit_stop_loss_pct
+        return default
+
+    def _position_take_profit_pct(self, default: float) -> float:
+        if self.position and self.position.exit_take_profit_pct is not None:
+            return self.position.exit_take_profit_pct
+        return default
+
+    def _position_max_hold_bars(self, default: Optional[int]) -> Optional[int]:
+        value = default
+        if self.position and self.position.exit_max_hold_bars is not None:
+            value = self.position.exit_max_hold_bars
+        if value is None or value <= 0:
+            return None
+        return value
+
+    @staticmethod
+    def _metadata_float(metadata: Optional[dict], key: str) -> Optional[float]:
+        if not metadata or metadata.get(key) in (None, ""):
+            return None
+        try:
+            return float(metadata[key])
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _metadata_int(metadata: Optional[dict], key: str) -> Optional[int]:
+        if not metadata or metadata.get(key) in (None, ""):
+            return None
+        try:
+            return int(metadata[key])
+        except (TypeError, ValueError):
+            return None
 
     def _position_net_pnl_at(self, price: float) -> float:
         if not self.position:

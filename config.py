@@ -265,6 +265,31 @@ class BTCTrendLongShortConfig:
     min_confidence: float = _get_env_float("BTC_LS_MIN_CONFIDENCE", 0.6)
 
 
+@dataclass
+class BTCRegimePullbackConfig:
+    """BTC 4h regime + entry timeframe pullback/mean-reversion 전략 설정"""
+    mode: str = os.getenv("BTC_RP_MODE", "combined")
+    entry_timeframe: str = os.getenv("BTC_RP_ENTRY_TIMEFRAME", "15m")
+    regime_timeframe: str = os.getenv("BTC_RP_REGIME_TIMEFRAME", "4h")
+    fast_ema: int = _get_env_int("BTC_RP_FAST_EMA", 12)
+    slow_ema: int = _get_env_int("BTC_RP_SLOW_EMA", 26)
+    slope_period: int = _get_env_int("BTC_RP_SLOPE_PERIOD", 6)
+    rsi_period: int = _get_env_int("BTC_RP_RSI_PERIOD", 14)
+    bb_period: int = _get_env_int("BTC_RP_BB_PERIOD", 20)
+    bb_std: float = _get_env_float("BTC_RP_BB_STD", 2.0)
+    regime_min_gap_pct: float = _get_env_float("BTC_RP_REGIME_MIN_GAP_PCT", 0.003)
+    pullback_rsi_long: float = _get_env_float("BTC_RP_PULLBACK_RSI_LONG", 35.0)
+    pullback_rsi_short: float = _get_env_float("BTC_RP_PULLBACK_RSI_SHORT", 65.0)
+    range_rsi_long: float = _get_env_float("BTC_RP_RANGE_RSI_LONG", 35.0)
+    range_rsi_short: float = _get_env_float("BTC_RP_RANGE_RSI_SHORT", 65.0)
+    trend_stop_loss_pct: float = _get_env_float("BTC_RP_TREND_STOP_LOSS_PCT", 1.0)
+    trend_take_profit_pct: float = _get_env_float("BTC_RP_TREND_TAKE_PROFIT_PCT", 1.5)
+    range_stop_loss_pct: float = _get_env_float("BTC_RP_RANGE_STOP_LOSS_PCT", 0.8)
+    range_take_profit_pct: float = _get_env_float("BTC_RP_RANGE_TAKE_PROFIT_PCT", 1.0)
+    range_max_hold_bars: int = _get_env_int("BTC_RP_RANGE_MAX_HOLD_BARS", 12)
+    min_confidence: float = _get_env_float("BTC_RP_MIN_CONFIDENCE", 0.6)
+
+
 # ============================================================
 # 백테스팅 설정
 # ============================================================

@@ -5,6 +5,7 @@ from strategies.bollinger_strategy import BollingerStrategy
 from strategies.grid_strategy import GridStrategy
 from strategies.ensemble import EnsembleStrategy
 from strategies.btc_trend_long_short import BTCTrendLongShortStrategy
+from strategies.btc_regime_pullback import BTCRegimePullbackStrategy
 
 __all__ = [
     "BaseStrategy",
@@ -16,4 +17,5 @@ __all__ = [
     "GridStrategy",
     "EnsembleStrategy",
     "BTCTrendLongShortStrategy",
+    "BTCRegimePullbackStrategy",
 ]
