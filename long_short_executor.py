@@ -17,14 +17,21 @@ from config import (
     DRY_RUN,
     LONG_SHORT_COOLDOWN_AFTER_LOSSES_MINUTES,
     LONG_SHORT_ENABLE_SIGNAL_CATCHUP,
+    LONG_SHORT_FEE_RATE,
     LONG_SHORT_LEVERAGE,
+    LONG_SHORT_BREAK_EVEN_AFTER_PCT,
+    LONG_SHORT_MAX_HOLD_BARS,
     LONG_SHORT_MAX_CONSECUTIVE_LOSSES,
     LONG_SHORT_MAX_DAILY_LOSS_PCT,
     LONG_SHORT_MAX_DAILY_LOSS_USDT,
     LONG_SHORT_MAX_DAILY_TRADES,
     LONG_SHORT_MAX_SIGNAL_AGE_MINUTES,
+    LONG_SHORT_MIN_REVERSE_NET_PNL_USDT,
     LONG_SHORT_ORDER_USDT,
     LONG_SHORT_POLL_INTERVAL,
+    LONG_SHORT_REGIME_TIMEFRAME,
+    LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+    LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE,
     LONG_SHORT_RISK_POLL_INTERVAL,
     LONG_SHORT_STOP_LOSS_PCT,
     LONG_SHORT_TAKE_PROFIT_PCT,
@@ -34,6 +41,14 @@ from config import (
 )
 from exchange import BinanceFuturesExchange, ExchangeUnavailableError
 from strategies import BTCTrendLongShortStrategy, Signal
+from strategies.btc_mtf_regime import (
+    apply_regime_gate,
+    bias_from_row,
+    closed_candles,
+    compute_regime_payload,
+    side_from_signal,
+    timeframe_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +82,9 @@ class BTCLongShortExecutor:
         self._last_market_update_at: Optional[str] = None
         self._entry_block_reason = "시장 상태 미확인"
         self._protection_reconciled = False
+        self._local_position_opened_at: Optional[datetime] = None
+        self._break_even_position_key: Optional[str] = None
+        self._break_even_armed = False
         self._safety_day = datetime.now().date()
         self._day_start_balance: Optional[float] = None
         self._daily_trade_count = 0
@@ -128,13 +146,19 @@ class BTCLongShortExecutor:
                 "enabled": True,
                 "market": "binance_futures_testnet",
                 "timeframe": self.timeframe,
+                "regime_timeframe": LONG_SHORT_REGIME_TIMEFRAME,
                 "order_usdt": LONG_SHORT_ORDER_USDT,
                 "leverage": LONG_SHORT_LEVERAGE,
                 "poll_interval": LONG_SHORT_POLL_INTERVAL,
                 "risk_poll_interval": LONG_SHORT_RISK_POLL_INTERVAL,
                 "signal_catchup_enabled": LONG_SHORT_ENABLE_SIGNAL_CATCHUP,
+                "regime_alignment_required": LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+                "reverse_only_when_profitable": LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE,
+                "min_reverse_net_pnl_usdt": LONG_SHORT_MIN_REVERSE_NET_PNL_USDT,
                 "stop_loss_pct": LONG_SHORT_STOP_LOSS_PCT,
                 "take_profit_pct": LONG_SHORT_TAKE_PROFIT_PCT,
+                "max_hold_bars": LONG_SHORT_MAX_HOLD_BARS,
+                "break_even_after_pct": LONG_SHORT_BREAK_EVEN_AFTER_PCT,
                 "last_action": last_action,
                 "last_error": last_error,
                 "market_state_status": market_state_status,
@@ -213,7 +237,16 @@ class BTCLongShortExecutor:
             self._set_market_stale("캔들 데이터 없음")
             return
 
-        signal_payload = self._build_signal_payload(df)
+        try:
+            regime_df = self.exchange.fetch_ohlcv(
+                self.symbol, LONG_SHORT_REGIME_TIMEFRAME, limit=240
+            )
+        except ExchangeUnavailableError as e:
+            self._set_market_error(e, "상위 시간봉 데이터 조회 실패")
+            regime_df = pd.DataFrame()
+        regime_df = closed_candles(regime_df, LONG_SHORT_REGIME_TIMEFRAME)
+
+        signal_payload = self._build_signal_payload(df, regime_df)
         self._set_status(signal_payload, "신호 관찰")
         market_state = self._read_market_state("시장 상태 조회 실패")
         if not market_state:
@@ -242,8 +275,9 @@ class BTCLongShortExecutor:
         if signal_key == self._last_signal_key:
             return
 
-        self._execute_side(side, signal_payload, position=position)
-        self._last_signal_key = signal_key
+        executed = self._execute_side(side, signal_payload, position=position)
+        if executed:
+            self._last_signal_key = signal_key
 
     def _signal_payload_for_entry(
         self, signal_payload: Dict[str, Any], position: Dict[str, Any]
@@ -264,7 +298,10 @@ class BTCLongShortExecutor:
         recent_side = recent_signal.get("side")
         if recent_side not in {"LONG", "SHORT"}:
             return signal_payload
-        if self._bias_side(signal_payload.get("bias")) != recent_side:
+        regime_side = signal_payload.get("regime_side")
+        if regime_side and regime_side != recent_side:
+            return signal_payload
+        if not regime_side and self._bias_side(signal_payload.get("bias")) != recent_side:
             return signal_payload
         if self._is_stale(recent_signal.get("time", "")):
             return signal_payload
@@ -284,6 +321,9 @@ class BTCLongShortExecutor:
                 ),
                 "catchup": True,
                 "source_signal_time": recent_signal.get("time"),
+                "raw_side": recent_side,
+                "regime_aligned": True,
+                "entry_block_reason": "",
             }
         )
         return catchup_payload
@@ -293,26 +333,33 @@ class BTCLongShortExecutor:
         side: str,
         signal_payload: Dict[str, Any],
         position: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> bool:
         if position is None:
             market_state = self._read_market_state("주문 전 시장 상태 조회 실패")
             if not market_state:
-                return
+                return False
             position, balance = market_state
             self._set_market_state(position=position, balance=balance)
         elif self._market_entry_block_reason():
             self._set_safety_status(signal_payload, self._market_entry_block_reason())
-            return
+            return False
 
         if position["side"] == side.lower():
             self._set_status(signal_payload, f"이미 {side} 포지션 보유")
             self._sync_protection_orders(position)
-            return
+            return True
 
         block_reason = self._entry_block_reason_for(position)
         if position["side"] == "flat" and block_reason:
             self._set_safety_status(signal_payload, block_reason)
-            return
+            return False
+
+        reverse_block_reason = self._reverse_block_reason(position, side, signal_payload)
+        if reverse_block_reason:
+            blocked_payload = dict(signal_payload)
+            blocked_payload["reverse_block_reason"] = reverse_block_reason
+            self._set_status(blocked_payload, f"전환 보류: {reverse_block_reason}")
+            return False
 
         close_orders = []
         if position["side"] != "flat":
@@ -322,14 +369,14 @@ class BTCLongShortExecutor:
             order = self.exchange.close_long(self.symbol, position["amount"])
             if not order:
                 self._set_error("CLOSE_LONG 주문 실패")
-                return
+                return False
             close_orders.append(self._order_record("CLOSE_LONG", order, signal_payload))
             self._record_closed_position(position, self._exit_price(position, signal_payload))
         elif position["side"] == "short" and side == "LONG":
             order = self.exchange.close_short(self.symbol, position["amount"])
             if not order:
                 self._set_error("CLOSE_SHORT 주문 실패")
-                return
+                return False
             close_orders.append(self._order_record("CLOSE_SHORT", order, signal_payload))
             self._record_closed_position(position, self._exit_price(position, signal_payload))
 
@@ -340,18 +387,29 @@ class BTCLongShortExecutor:
                 self._last_error = ""
             market_state = self._read_market_state("전환 후 시장 상태 조회 실패")
             if not market_state:
-                return
+                return True
             position, balance = market_state
             self._set_market_state(position=position, balance=balance)
             block_reason = self._entry_block_reason_for(position)
             if block_reason:
                 self._set_safety_status(signal_payload, block_reason)
-                return
+                return True
+
+        min_notional = self._min_order_notional()
+        if min_notional and LONG_SHORT_ORDER_USDT < min_notional:
+            self._set_safety_status(
+                signal_payload,
+                (
+                    f"주문 금액 ${LONG_SHORT_ORDER_USDT:.2f}가 "
+                    f"Futures 최소 명목금액 ${min_notional:.2f}보다 작습니다."
+                ),
+            )
+            return False
 
         amount = self.exchange.amount_from_usdt(self.symbol, LONG_SHORT_ORDER_USDT)
         if amount <= 0:
             self._set_error("주문 수량 계산 실패")
-            return
+            return False
 
         if side == "LONG":
             order = self.exchange.open_long(self.symbol, amount)
@@ -367,13 +425,18 @@ class BTCLongShortExecutor:
                 self._daily_trade_count += 1
                 self._last_action = action
                 self._last_error = ""
+                self._local_position_opened_at = datetime.now()
+                self._break_even_position_key = None
+                self._break_even_armed = False
             market_state = self._read_market_state("주문 후 시장 상태 조회 실패")
             if market_state:
                 position, balance = market_state
                 self._set_market_state(position=position, balance=balance)
             self._ensure_protection_orders(position)
+            return True
         else:
             self._set_error(f"{action} 주문 실패")
+            return False
 
     def _exit_for_safety(
         self, position: Dict[str, Any], signal_payload: Dict[str, Any]
@@ -424,7 +487,9 @@ class BTCLongShortExecutor:
         self, position: Dict[str, Any], signal_payload: Dict[str, Any]
     ) -> bool:
         if position["side"] == "flat":
+            self._sync_position_risk_state(position)
             return False
+        self._sync_position_risk_state(position)
 
         entry_price = float(position.get("entry_price") or 0.0)
         current_price = float(
@@ -438,21 +503,47 @@ class BTCLongShortExecutor:
         stop_loss, take_profit = self._risk_levels(position["side"], entry_price)
         action = ""
         reason = ""
+        break_even_armed = self._break_even_is_armed()
 
         if position["side"] == "long":
-            if current_price <= stop_loss:
+            if not break_even_armed and current_price <= stop_loss:
                 action = "STOP_LONG"
                 reason = f"롱 손절: {current_price:.2f} <= {stop_loss:.2f}"
-            elif current_price >= take_profit:
+            if (
+                not action
+                and self._should_arm_break_even_now(
+                    "long", entry_price, current_price
+                )
+            ):
+                self._set_break_even_armed(True)
+                break_even_armed = True
+            if not action and break_even_armed and current_price <= entry_price:
+                action = "BREAKEVEN_LONG"
+                reason = f"롱 본전 청산: {current_price:.2f} <= {entry_price:.2f}"
+            elif not action and current_price >= take_profit:
                 action = "TAKE_LONG"
                 reason = f"롱 익절: {current_price:.2f} >= {take_profit:.2f}"
         elif position["side"] == "short":
-            if current_price >= stop_loss:
+            if not break_even_armed and current_price >= stop_loss:
                 action = "STOP_SHORT"
                 reason = f"숏 손절: {current_price:.2f} >= {stop_loss:.2f}"
-            elif current_price <= take_profit:
+            if (
+                not action
+                and self._should_arm_break_even_now(
+                    "short", entry_price, current_price
+                )
+            ):
+                self._set_break_even_armed(True)
+                break_even_armed = True
+            if not action and break_even_armed and current_price >= entry_price:
+                action = "BREAKEVEN_SHORT"
+                reason = f"숏 본전 청산: {current_price:.2f} >= {entry_price:.2f}"
+            elif not action and current_price <= take_profit:
                 action = "TAKE_SHORT"
                 reason = f"숏 익절: {current_price:.2f} <= {take_profit:.2f}"
+
+        if not action:
+            action, reason = self._time_exit_action(position)
 
         if not action:
             return False
@@ -483,7 +574,122 @@ class BTCLongShortExecutor:
             self._last_error = ""
             self._last_position = self._flat_position()
             self._last_protection_orders = []
+            self._clear_position_risk_state_locked()
         return True
+
+    def _sync_position_risk_state(self, position: Dict[str, Any]):
+        key = self._position_key(position)
+        with self._lock:
+            if not key:
+                self._clear_position_risk_state_locked()
+                return
+            if self._break_even_position_key != key:
+                self._break_even_position_key = key
+                self._break_even_armed = False
+
+    def _clear_position_risk_state_locked(self):
+        self._local_position_opened_at = None
+        self._break_even_position_key = None
+        self._break_even_armed = False
+
+    def _break_even_is_armed(self) -> bool:
+        with self._lock:
+            return self._break_even_armed
+
+    def _set_break_even_armed(self, armed: bool):
+        with self._lock:
+            self._break_even_armed = armed
+
+    @staticmethod
+    def _should_arm_break_even_now(
+        side: str,
+        entry_price: float,
+        current_price: float,
+    ) -> bool:
+        if LONG_SHORT_BREAK_EVEN_AFTER_PCT <= 0:
+            return False
+        if side == "long":
+            trigger = entry_price * (1 + LONG_SHORT_BREAK_EVEN_AFTER_PCT / 100)
+            return current_price >= trigger
+        trigger = entry_price * (1 - LONG_SHORT_BREAK_EVEN_AFTER_PCT / 100)
+        return current_price <= trigger
+
+    def _time_exit_action(self, position: Dict[str, Any]) -> tuple[str, str]:
+        if LONG_SHORT_MAX_HOLD_BARS <= 0:
+            return "", ""
+        opened_at = self._position_opened_at(position)
+        if not opened_at:
+            return "", ""
+
+        max_hold_seconds = self._timeframe_seconds() * LONG_SHORT_MAX_HOLD_BARS
+        elapsed_seconds = (datetime.now() - opened_at).total_seconds()
+        if elapsed_seconds < max_hold_seconds:
+            return "", ""
+
+        side = position["side"]
+        action = "TIME_EXIT_LONG" if side == "long" else "TIME_EXIT_SHORT"
+        label = "롱" if side == "long" else "숏"
+        elapsed_minutes = elapsed_seconds / 60
+        max_hold_minutes = max_hold_seconds / 60
+        return (
+            action,
+            f"{label} 시간 청산: {elapsed_minutes:.1f}분 >= {max_hold_minutes:.1f}분",
+        )
+
+    def _position_opened_at(self, position: Dict[str, Any]) -> Optional[datetime]:
+        with self._lock:
+            opened_at = self._local_position_opened_at
+        if opened_at:
+            return opened_at
+
+        raw = position.get("raw") or {}
+        info = raw.get("info") if isinstance(raw, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        for value in (
+            position.get("timestamp"),
+            raw.get("timestamp") if isinstance(raw, dict) else None,
+            raw.get("datetime") if isinstance(raw, dict) else None,
+            info.get("updateTime"),
+            info.get("time"),
+        ):
+            parsed = self._parse_position_time(value)
+            if parsed:
+                return parsed
+        return None
+
+    @staticmethod
+    def _parse_position_time(value: Any) -> Optional[datetime]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None)
+        try:
+            if isinstance(value, str) and not value.replace(".", "", 1).isdigit():
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(
+                    tzinfo=None
+                )
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        try:
+            return datetime.utcfromtimestamp(timestamp)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _position_key(position: Dict[str, Any]) -> Optional[str]:
+        if position.get("side") == "flat":
+            return None
+        return ":".join(
+            [
+                str(position.get("side", "")),
+                f"{float(position.get('entry_price') or 0.0):.8f}",
+                f"{float(position.get('amount') or 0.0):.8f}",
+            ]
+        )
 
     def _entry_block_reason_for(self, position: Dict[str, Any]) -> str:
         return (
@@ -645,6 +851,7 @@ class BTCLongShortExecutor:
                     f"연속 손실 {self._consecutive_losses}회, "
                     f"{LONG_SHORT_COOLDOWN_AFTER_LOSSES_MINUTES}분 쿨다운"
                 )
+            self._clear_position_risk_state_locked()
 
     def _exit_price(
         self,
@@ -795,17 +1002,26 @@ class BTCLongShortExecutor:
                         pass
         return 0.0
 
-    def _build_signal_payload(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def _build_signal_payload(
+        self,
+        df: pd.DataFrame,
+        regime_df: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, Any]:
         signal = self.strategy.analyze(df, self.symbol)
         indicators = self.strategy.get_indicators(df)
         latest = indicators.iloc[-1]
+        regime_payload = compute_regime_payload(
+            regime_df if regime_df is not None else pd.DataFrame(),
+            LONG_SHORT_REGIME_TIMEFRAME,
+            self.strategy.config,
+        )
 
-        return {
+        payload = {
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "signal": signal.signal.value,
             "side": self._side(signal.signal),
-            "bias": self._bias(latest),
+            "bias": bias_from_row(latest),
             "confidence": self._number(signal.confidence),
             "price": self._number(signal.price),
             "reason": signal.reason,
@@ -815,10 +1031,28 @@ class BTCLongShortExecutor:
             "ema_slope": self._number(latest.get("ema_slope")),
             "rsi": self._number(latest.get("rsi")),
             "trend_gap": self._number(latest.get("trend_gap")),
-            "recent_signals": self._recent_signals(df),
+            "recent_signals": self._recent_signals(
+                df, regime_payload.get("regime_side")
+            ),
+            "entry_block_reason": "",
+            "reverse_block_reason": "",
+            "reverse_policy": (
+                "profit_only"
+                if LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE
+                else "always"
+            ),
         }
+        return apply_regime_gate(
+            payload,
+            regime_payload,
+            LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+        )
 
-    def _recent_signals(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+    def _recent_signals(
+        self,
+        df: pd.DataFrame,
+        regime_side: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         config = self.strategy.config
         min_rows = max(config.slow_ema, config.rsi_period) + config.slope_period + 2
@@ -829,11 +1063,20 @@ class BTCLongShortExecutor:
             signal = self.strategy.analyze(window, self.symbol)
             if signal.signal == Signal.HOLD:
                 continue
+            side = self._side(signal.signal)
+            if (
+                LONG_SHORT_REQUIRE_REGIME_ALIGNMENT
+                and regime_side
+                and side != regime_side
+            ):
+                continue
             rows.append(
                 {
                     "time": window.index[-1].isoformat(),
                     "signal": signal.signal.value,
-                    "side": self._side(signal.signal),
+                    "side": side,
+                    "regime_side": regime_side,
+                    "regime_aligned": not regime_side or side == regime_side,
                     "price": self._number(signal.price),
                     "confidence": self._number(signal.confidence),
                     "reason": signal.reason,
@@ -848,6 +1091,7 @@ class BTCLongShortExecutor:
 
         entry_price = float(position.get("entry_price") or 0.0)
         stop_loss, take_profit = self._risk_levels(position["side"], entry_price)
+        opened_at = self._position_opened_at(position)
         return [
             {
                 "symbol": self.symbol,
@@ -857,6 +1101,10 @@ class BTCLongShortExecutor:
                 "amount": position["amount"],
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
+                "max_hold_bars": LONG_SHORT_MAX_HOLD_BARS,
+                "break_even_after_pct": LONG_SHORT_BREAK_EVEN_AFTER_PCT,
+                "break_even_armed": self._break_even_is_armed(),
+                "opened_at": opened_at.isoformat() if opened_at else None,
                 "unrealized_pnl": float(position.get("unrealized_pnl") or 0.0),
                 "liquidation_price": float(position.get("liquidation_price") or 0.0),
                 "pnl_pct": float(position.get("percentage") or 0.0),
@@ -874,6 +1122,41 @@ class BTCLongShortExecutor:
             stop_loss = entry_price * (1 - LONG_SHORT_STOP_LOSS_PCT / 100)
             take_profit = entry_price * (1 + LONG_SHORT_TAKE_PROFIT_PCT / 100)
         return stop_loss, take_profit
+
+    def _reverse_block_reason(
+        self,
+        position: Dict[str, Any],
+        target_side: str,
+        signal_payload: Dict[str, Any],
+    ) -> str:
+        if not LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE:
+            return ""
+        if position["side"] == "flat" or position["side"] == target_side.lower():
+            return ""
+
+        current_price = float(
+            position.get("mark_price") or signal_payload.get("price") or 0.0
+        )
+        net_pnl = self._estimated_net_pnl_after_close(position, current_price)
+        if net_pnl >= LONG_SHORT_MIN_REVERSE_NET_PNL_USDT:
+            return ""
+        return (
+            f"예상 순손익 ${net_pnl:.2f} < "
+            f"${LONG_SHORT_MIN_REVERSE_NET_PNL_USDT:.2f}"
+        )
+
+    @staticmethod
+    def _estimated_net_pnl_after_close(
+        position: Dict[str, Any],
+        exit_price: float,
+    ) -> float:
+        entry_price = float(position.get("entry_price") or 0.0)
+        amount = float(position.get("amount") or 0.0)
+        if entry_price <= 0 or exit_price <= 0 or amount <= 0:
+            return 0.0
+        gross_pnl = BTCLongShortExecutor._position_pnl(position, exit_price)
+        fee = (entry_price + exit_price) * amount * LONG_SHORT_FEE_RATE
+        return gross_pnl - fee
 
     def _order_record(
         self, action: str, order: Dict[str, Any], signal_payload: Dict[str, Any]
@@ -943,6 +1226,15 @@ class BTCLongShortExecutor:
                 return "거래소 rate limit으로 신규 진입 차단"
             return self._entry_block_reason or "시장 상태 미확인"
 
+    def _min_order_notional(self) -> float:
+        getter = getattr(self.exchange, "get_min_order_notional", None)
+        if not getter:
+            return 0.0
+        try:
+            return float(getter(self.symbol))
+        except Exception:
+            return 0.0
+
     def _set_market_state(
         self,
         position: Optional[Dict[str, Any]] = None,
@@ -951,6 +1243,8 @@ class BTCLongShortExecutor:
         with self._lock:
             if position is not None:
                 self._last_position = dict(position)
+                if position.get("side") == "flat":
+                    self._clear_position_risk_state_locked()
             if balance is not None:
                 self._last_balance = float(balance or 0.0)
                 self._sync_safety_day_locked(self._last_balance)
@@ -1012,34 +1306,10 @@ class BTCLongShortExecutor:
         return "HOLD"
 
     def _closed_candles(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-
-        timeframe_seconds = self._timeframe_seconds()
-        if timeframe_seconds <= 0:
-            return df
-
-        latest = df.index[-1]
-        if getattr(latest, "tzinfo", None):
-            latest = latest.tz_convert(None)
-        close_time = latest.to_pydatetime() + timedelta(seconds=timeframe_seconds)
-        if datetime.utcnow() < close_time:
-            return df.iloc[:-1]
-        return df
+        return closed_candles(df, self.timeframe)
 
     def _timeframe_seconds(self) -> int:
-        unit = self.timeframe[-1]
-        try:
-            value = int(self.timeframe[:-1])
-        except ValueError:
-            return 0
-        if unit == "m":
-            return value * 60
-        if unit == "h":
-            return value * 60 * 60
-        if unit == "d":
-            return value * 24 * 60 * 60
-        return 0
+        return timeframe_seconds(self.timeframe)
 
     @staticmethod
     def _flat_position() -> Dict[str, Any]:
@@ -1055,19 +1325,11 @@ class BTCLongShortExecutor:
 
     @staticmethod
     def _bias(row: pd.Series) -> str:
-        if row["ema_fast"] > row["ema_slow"] and row["ema_slope"] > 0:
-            return "LONG_BIAS"
-        if row["ema_fast"] < row["ema_slow"] and row["ema_slope"] < 0:
-            return "SHORT_BIAS"
-        return "NEUTRAL"
+        return bias_from_row(row)
 
     @staticmethod
     def _side(signal: Signal) -> str:
-        if signal == Signal.BUY:
-            return "LONG"
-        if signal == Signal.SELL:
-            return "SHORT"
-        return "HOLD"
+        return side_from_signal(signal)
 
     def _empty_signal_payload(self, reason: str) -> Dict[str, Any]:
         return {
@@ -1075,11 +1337,25 @@ class BTCLongShortExecutor:
             "timeframe": self.timeframe,
             "signal": Signal.HOLD.value,
             "side": "HOLD",
+            "raw_signal": Signal.HOLD.value,
+            "raw_side": "HOLD",
             "bias": "NEUTRAL",
             "confidence": 0.0,
             "price": 0.0,
             "reason": reason,
             "updated_at": datetime.utcnow().isoformat(),
+            "regime_timeframe": LONG_SHORT_REGIME_TIMEFRAME,
+            "regime_side": "NEUTRAL",
+            "regime_closed_at": None,
+            "regime_aligned": False,
+            "regime_alignment_required": LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+            "entry_block_reason": "",
+            "reverse_policy": (
+                "profit_only"
+                if LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE
+                else "always"
+            ),
+            "reverse_block_reason": "",
             "recent_signals": [],
         }
 

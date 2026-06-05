@@ -2,9 +2,16 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
-from config import LONG_SHORT_MAX_CONSECUTIVE_LOSSES, LONG_SHORT_MAX_DAILY_TRADES
+import pandas as pd
+
+from config import (
+    BTCTrendLongShortConfig,
+    LONG_SHORT_MAX_CONSECUTIVE_LOSSES,
+    LONG_SHORT_MAX_DAILY_TRADES,
+)
 from exchange import ExchangeUnavailableError
 from long_short_executor import BTCLongShortExecutor
+from strategies.base import Signal, TradeSignal
 
 
 class FakeFuturesExchange:
@@ -43,6 +50,9 @@ class FakeFuturesExchange:
 
     def amount_from_usdt(self, symbol, usdt_amount):
         return 0.001
+
+    def get_min_order_notional(self, symbol):
+        return 0.0
 
     def open_long(self, symbol, amount):
         self.actions.append(("open_long", amount))
@@ -142,6 +152,9 @@ def make_executor(exchange):
     executor._last_market_update_at = datetime.now().isoformat()
     executor._entry_block_reason = ""
     executor._protection_reconciled = False
+    executor._local_position_opened_at = None
+    executor._break_even_position_key = None
+    executor._break_even_armed = False
     executor._safety_day = datetime.now().date()
     executor._day_start_balance = 5000.0
     executor._daily_trade_count = 0
@@ -150,6 +163,53 @@ def make_executor(exchange):
     executor._last_safety_reason = ""
     executor.running = True
     return executor
+
+
+class FakeSignalStrategy:
+    def __init__(self, signal):
+        self.name = "FakeSignal"
+        self.config = BTCTrendLongShortConfig(
+            fast_ema=2,
+            slow_ema=3,
+            slope_period=1,
+            rsi_period=2,
+            min_confidence=0.0,
+        )
+        self.signal = signal
+
+    def analyze(self, df, symbol):
+        signal = self.signal if len(df) >= 60 else Signal.HOLD
+        return TradeSignal(
+            signal=signal,
+            symbol=symbol,
+            strategy_name=self.name,
+            confidence=1.0 if signal != Signal.HOLD else 0.0,
+            price=float(df["close"].iloc[-1]),
+            reason=f"fake {signal.value}",
+        )
+
+    def get_indicators(self, df):
+        df = df.copy()
+        df["ema_fast"] = df["close"].ewm(span=2, adjust=False).mean()
+        df["ema_slow"] = df["close"].ewm(span=3, adjust=False).mean()
+        df["ema_slope"] = df["ema_slow"] - df["ema_slow"].shift(1)
+        df["rsi"] = 60.0
+        df["trend_gap"] = (df["ema_fast"] - df["ema_slow"]) / df["ema_slow"]
+        return df
+
+
+def make_ohlcv(rows=60, freq="10min", start=100.0, step=1.0):
+    index = pd.date_range("2026-01-01", periods=rows, freq=freq)
+    close = pd.Series([start + i * step for i in range(rows)], index=index)
+    return pd.DataFrame(
+        {
+            "open": close,
+            "high": close + 1,
+            "low": close - 1,
+            "close": close,
+            "volume": 1000,
+        }
+    )
 
 
 class LongShortExecutorTest(unittest.TestCase):
@@ -166,11 +226,26 @@ class LongShortExecutorTest(unittest.TestCase):
         self.assertIn("SET_STOP_LOSS", [o["action"] for o in executor.order_history])
         self.assertIn("SET_TAKE_PROFIT", [o["action"] for o in executor.order_history])
 
-    def test_execute_short_closes_long_then_opens_short(self):
-        exchange = FakeFuturesExchange(side="long")
+    def test_min_notional_blocks_entry_before_order(self):
+        exchange = FakeFuturesExchange()
+        exchange.get_min_order_notional = lambda symbol: 50.0
         executor = make_executor(exchange)
 
-        executor._execute_side("SHORT", {"side": "SHORT", "price": 100, "confidence": 1, "reason": "test"})
+        with patch("long_short_executor.LONG_SHORT_ORDER_USDT", 25.0):
+            executed = executor._execute_side(
+                "SHORT",
+                {"side": "SHORT", "price": 100, "confidence": 1, "reason": "test"},
+            )
+
+        self.assertFalse(executed)
+        self.assertEqual(exchange.actions, [])
+        self.assertIn("최소 명목금액", executor._last_action)
+
+    def test_execute_short_closes_profitable_long_then_opens_short(self):
+        exchange = FakeFuturesExchange(side="long", entry_price=100.0, mark_price=103.0)
+        executor = make_executor(exchange)
+
+        executor._execute_side("SHORT", {"side": "SHORT", "price": 103, "confidence": 1, "reason": "test"})
 
         self.assertEqual(exchange.actions[0], ("close_long", 0.01))
         self.assertEqual(exchange.actions[1], ("open_short", 0.001))
@@ -179,6 +254,47 @@ class LongShortExecutorTest(unittest.TestCase):
             [o["action"] for o in executor.order_history[:2]],
             ["CLOSE_LONG", "OPEN_SHORT"],
         )
+
+    def test_unprofitable_reverse_signal_does_not_close_or_flip(self):
+        exchange = FakeFuturesExchange(side="long", entry_price=100.0, mark_price=100.0)
+        executor = make_executor(exchange)
+
+        executor._execute_side("SHORT", {"side": "SHORT", "price": 100, "confidence": 1, "reason": "test"})
+
+        self.assertEqual(exchange.actions, [])
+        self.assertEqual(executor.order_history, [])
+        self.assertIn("전환 보류", executor._last_action)
+        self.assertIn("예상 순손익", executor._last_signal["reverse_block_reason"])
+
+    def test_signal_payload_blocks_entry_when_regime_mismatches(self):
+        exchange = FakeFuturesExchange()
+        executor = make_executor(exchange)
+        executor.strategy = FakeSignalStrategy(Signal.BUY)
+
+        payload = executor._build_signal_payload(
+            make_ohlcv(start=100.0, step=1.0),
+            make_ohlcv(rows=10, freq="4h", start=110.0, step=-1.0),
+        )
+
+        self.assertEqual(payload["raw_side"], "LONG")
+        self.assertEqual(payload["regime_side"], "SHORT")
+        self.assertEqual(payload["side"], "HOLD")
+        self.assertIn("regime mismatch", payload["entry_block_reason"])
+
+    def test_signal_payload_allows_entry_when_regime_matches(self):
+        exchange = FakeFuturesExchange()
+        executor = make_executor(exchange)
+        executor.strategy = FakeSignalStrategy(Signal.BUY)
+
+        payload = executor._build_signal_payload(
+            make_ohlcv(start=100.0, step=1.0),
+            make_ohlcv(rows=10, freq="4h", start=100.0, step=1.0),
+        )
+
+        self.assertEqual(payload["raw_side"], "LONG")
+        self.assertEqual(payload["regime_side"], "LONG")
+        self.assertEqual(payload["side"], "LONG")
+        self.assertEqual(payload["entry_block_reason"], "")
 
     def test_risk_exit_closes_long_at_stop_loss(self):
         exchange = FakeFuturesExchange(side="long", entry_price=100.0, mark_price=98.0)
@@ -205,6 +321,41 @@ class LongShortExecutorTest(unittest.TestCase):
         self.assertTrue(exited)
         self.assertEqual(exchange.actions, [("close_short", 0.01)])
         self.assertEqual(executor.order_history[0]["action"], "TAKE_SHORT")
+
+    def test_risk_exit_closes_short_at_break_even_after_profit(self):
+        exchange = FakeFuturesExchange(side="short", entry_price=100.0, mark_price=99.4)
+        executor = make_executor(exchange)
+
+        with patch("long_short_executor.LONG_SHORT_BREAK_EVEN_AFTER_PCT", 0.5):
+            armed = executor._exit_for_risk(
+                exchange.fetch_position("BTC/USDT"),
+                {"side": "HOLD", "price": 99.4, "confidence": 0, "reason": "test"},
+            )
+            exchange.position["mark_price"] = 100.0
+            exited = executor._exit_for_risk(
+                exchange.fetch_position("BTC/USDT"),
+                {"side": "HOLD", "price": 100.0, "confidence": 0, "reason": "test"},
+            )
+
+        self.assertFalse(armed)
+        self.assertTrue(exited)
+        self.assertEqual(exchange.actions, [("close_short", 0.01)])
+        self.assertEqual(executor.order_history[0]["action"], "BREAKEVEN_SHORT")
+
+    def test_risk_exit_closes_long_after_max_hold_bars(self):
+        exchange = FakeFuturesExchange(side="long", entry_price=100.0, mark_price=100.1)
+        executor = make_executor(exchange)
+        executor._local_position_opened_at = datetime.utcnow() - timedelta(minutes=91)
+
+        with patch("long_short_executor.LONG_SHORT_MAX_HOLD_BARS", 9):
+            exited = executor._exit_for_risk(
+                exchange.fetch_position("BTC/USDT"),
+                {"side": "HOLD", "price": 100.1, "confidence": 0, "reason": "test"},
+            )
+
+        self.assertTrue(exited)
+        self.assertEqual(exchange.actions, [("close_long", 0.01)])
+        self.assertEqual(executor.order_history[0]["action"], "TIME_EXIT_LONG")
 
     def test_get_status_uses_cached_market_state(self):
         exchange = FakeFuturesExchange(side="long", entry_price=100.0, mark_price=101.0)

@@ -146,9 +146,13 @@ python main.py --backtest-long-short
 ```
 
 기본 검증값은 10분봉 최대 5000개, 손절 2.0%, 익절 4.0%입니다.
-롱/숏 백테스트는 실제 실행기의 `LONG_SHORT_ORDER_USDT`와 같은 고정 명목금액 기준으로 포지션을 계산하고, 반대 신호가 나오면 청산 후 즉시 반대 포지션으로 전환하는 executor-like 결과를 기본으로 출력합니다.
-결과에는 both, long-only, short-only 비교와 gross PnL, fee, net PnL, 청산 사유, 보유시간 요약이 함께 표시됩니다.
-같은 명령에서 롱 RSI 필터, 시간 청산, 상위봉 추세 필터, EMA gap, EMA slope 실험도 고정 비교표로 확인할 수 있습니다.
+`LONG_SHORT_MAX_HOLD_BARS=0`, `LONG_SHORT_BREAK_EVEN_AFTER_PCT=0.0`이면 시간청산과 본전스탑은 꺼집니다.
+롱/숏 백테스트는 실제 실행기의 `LONG_SHORT_ORDER_USDT`와 같은 고정 명목금액 기준으로 포지션을 계산합니다.
+기본 실행 프로필은 10분봉 raw 신호를 진입 타이밍으로 쓰고, 닫힌 4시간봉 regime과 방향이 같을 때만 실행 신호로 통과시킵니다.
+반대 신호로 인한 청산/전환은 예상 순손익이 수수료 기준을 넘을 때만 허용하고, 손절/익절/일일 손실 제한은 이 규칙보다 우선합니다.
+Binance Futures 테스트넷은 신규 주문의 최소 명목금액을 요구하므로 `LONG_SHORT_ORDER_USDT`는 기본 예시처럼 60 이상으로 두는 편이 안전합니다.
+결과에는 현재 MTF 기본 전략, raw executor-like baseline, long-only, short-only 비교와 gross PnL, fee, net PnL, regime 차단 수, reverse 차단 수, 청산 사유, 보유시간 요약이 함께 표시됩니다.
+같은 명령에서 비용/슬리피지 스트레스, 기간별 OOS, 고정 파라미터 walk-forward holdout, 파라미터 민감도, 시간대 필터, 월별 성과, regime/변동성 breakdown, 거래 분포도 함께 확인할 수 있습니다.
 파라미터는 `.env`에서 `BTC_LS_FAST_EMA`, `BTC_LS_SLOW_EMA`, `BTC_LS_RSI_PERIOD` 등으로 조정할 수 있습니다.
 실제 주문 없이 현재 신호와 최근 롱/숏 신호를 보려면 `--observe-long-short`를 실행하세요.
 
@@ -164,14 +168,15 @@ ENABLE_LONG_SHORT_EXECUTION=true
 
 먼저 `python main.py --check-futures`로 Futures 잔고 인증이 성공하는지 확인한 다음,
 `python main.py --trade-long-short`를 실행하세요.
-기본 봉은 `LONG_SHORT_TIMEFRAME=10m`, 주문 판단 주기는 `LONG_SHORT_POLL_INTERVAL=600`입니다.
+기본 진입 봉은 `LONG_SHORT_TIMEFRAME=10m`, regime 봉은 `BTC_LS_REGIME_TIMEFRAME=4h`, 주문 판단 주기는 `LONG_SHORT_POLL_INTERVAL=600`입니다.
 리스크 감시는 `LONG_SHORT_RISK_POLL_INTERVAL=180`으로 별도 실행됩니다.
-기본 주문 금액은 `LONG_SHORT_ORDER_USDT=25`, 기본 레버리지는 `LONG_SHORT_LEVERAGE=1`입니다.
+기본 주문 금액은 `LONG_SHORT_ORDER_USDT=60`, 기본 레버리지는 `LONG_SHORT_LEVERAGE=1`입니다.
 대시보드의 `WAIT_LONG_BIAS` / `WAIT_SHORT_BIAS`는 현재 추세 편향을 보여주는 대기 상태이며, 실제 포지션 진입 신호와는 구분됩니다.
-재시작 직후 최근 신호를 따라잡아 테스트넷 진입까지 허용하려면 `LONG_SHORT_ENABLE_SIGNAL_CATCHUP=true`를 설정하세요. 이 경우에도 flat 상태, 같은 방향 bias, `LONG_SHORT_MAX_SIGNAL_AGE_MINUTES` 이내 신호일 때만 작동합니다.
+재시작 직후 최근 신호를 따라잡아 테스트넷 진입까지 허용하려면 `LONG_SHORT_ENABLE_SIGNAL_CATCHUP=true`를 설정하세요. 이 경우에도 flat 상태, 같은 방향 4시간봉 regime, `LONG_SHORT_MAX_SIGNAL_AGE_MINUTES` 이내 신호일 때만 작동합니다.
 Futures 실행기는 진입 직후 `STOP_MARKET`/`TAKE_PROFIT_MARKET` reduce-only 보호 주문을 거래소에 생성합니다.
 거래소 조회 실패나 rate limit이 감지되면 신규 진입은 차단되고, 마지막으로 확인된 포지션 상태를 `flat`으로 덮어쓰지 않습니다.
-포지션 보유 중에는 봇 내부 손절/익절 조건도 보조로 확인한 뒤 새 롱/숏 신호를 처리합니다.
+포지션 보유 중에는 봇 내부 손절/익절 조건을 보조로 확인한 뒤 새 롱/숏 신호를 처리합니다. 시간청산과 본전스탑은 설정값이 0보다 클 때만 추가로 작동합니다.
+`BTC_LS_REVERSE_ONLY_WHEN_PROFITABLE=true`이면 반대 신호는 예상 순손익이 `BTC_LS_MIN_REVERSE_NET_PNL_USDT` 이상일 때만 close/flip을 실행합니다.
 안전장치는 하루 손실 `LONG_SHORT_MAX_DAILY_LOSS_USDT=50` 또는
 `LONG_SHORT_MAX_DAILY_LOSS_PCT=3.0`, 하루 신규 진입
 `LONG_SHORT_MAX_DAILY_TRADES=10`, 연속 손실

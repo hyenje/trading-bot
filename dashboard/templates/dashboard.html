@@ -256,6 +256,7 @@
 
         function signalDisplaySide(signal) {
             const side = signal.side || 'HOLD';
+            if (signal.entry_block_reason) return 'HOLD';
             if (side !== 'HOLD') return side;
             if (signal.bias === 'LONG_BIAS') return 'WAIT_LONG_BIAS';
             if (signal.bias === 'SHORT_BIAS') return 'WAIT_SHORT_BIAS';
@@ -277,18 +278,25 @@
             const side = signalDisplaySide(signal);
             const sideEl = document.getElementById('signal-side');
             sideEl.innerHTML = `<span class="tag ${sideClass(side)}">${sideLabel(side)}</span>`;
-            document.getElementById('signal-reason').textContent = signal.reason || '-';
+            const rawSide = signal.raw_side || signal.side || 'HOLD';
+            const blockReason = signal.entry_block_reason || signal.reverse_block_reason || '';
+            document.getElementById('signal-reason').textContent =
+                blockReason || signal.reason || '-';
 
             const bias = signal.bias || 'NEUTRAL';
+            const regimeSide = signal.regime_side || 'NEUTRAL';
             const biasEl = document.getElementById('signal-bias');
-            biasEl.innerHTML = `<span class="tag ${sideClass(biasLabel(bias))}">${biasLabel(bias)}</span>`;
+            biasEl.innerHTML =
+                `<span class="tag ${sideClass(biasLabel(bias))}">${biasLabel(bias)}</span>` +
+                ` <span class="tag ${sideClass(regimeSide)}">${regimeSide}</span>`;
             document.getElementById('signal-indicators').textContent =
-                `Price ${formatMoney(signal.price)} · RSI ${Number(signal.rsi || 0).toFixed(1)} · Gap ${(Number(signal.trend_gap || 0) * 100).toFixed(2)}%`;
+                `10m raw ${rawSide} · Price ${formatMoney(signal.price)} · RSI ${Number(signal.rsi || 0).toFixed(1)} · ` +
+                `4h slope ${Number(signal.regime_ema_slope || 0).toFixed(2)}`;
 
             document.getElementById('signal-confidence').textContent =
                 `${(Number(signal.confidence || 0) * 100).toFixed(1)}%`;
             document.getElementById('signal-updated').textContent =
-                `${signal.symbol || '-'} · ${signal.timeframe || '-'} · ${signal.updated_at || '-'}`;
+                `${signal.symbol || '-'} · entry ${signal.timeframe || '-'} · regime ${signal.regime_timeframe || '-'} · ${signal.updated_at || '-'}`;
 
             renderSignals(signal.recent_signals || []);
         }
@@ -332,18 +340,21 @@
                 ? safety.block_reason
                 : `${Number(safety.daily_trade_count || 0)}/${Number(safety.max_daily_trades || 0)}회 · 손실 ${Number(safety.daily_loss_pct || 0).toFixed(2)}% · 연손 ${Number(safety.consecutive_losses || 0)}/${Number(safety.max_consecutive_losses || 0)}`;
             const entryBlock = status.entry_block_reason || '-';
+            const reversePolicy = status.reverse_only_when_profitable
+                ? `reverse net >= ${formatMoney(status.min_reverse_net_pnl_usdt)}`
+                : 'reverse always';
             const lastError = status.last_market_error || status.last_error || '-';
             statusTable.innerHTML = `<tr>
                 <td><span class="tag ${status.enabled ? 'tag-long' : 'tag-hold'}">${status.enabled ? 'ON' : 'OFF'}</span></td>
                 <td><span class="tag ${marketClass}">${marketState}</span><br><span class="muted">${status.last_market_update_at || '-'}</span></td>
-                <td>${status.timeframe || '-'} / ${Number(status.poll_interval || 0)}s${status.signal_catchup_enabled ? ' · catch-up' : ''}</td>
+                <td>${status.timeframe || '-'} entry / ${status.regime_timeframe || '-'} regime<br><span class="muted">${Number(status.poll_interval || 0)}s${status.signal_catchup_enabled ? ' · catch-up' : ''}</span></td>
                 <td>${Number(status.risk_poll_interval || 0)}s</td>
                 <td>${protectionCount}</td>
                 <td>${safetyText}</td>
                 <td>${entryBlock}</td>
                 <td>${formatMoney(status.order_usdt)}</td>
                 <td>${Number(status.leverage || 1)}x</td>
-                <td>SL ${Number(status.stop_loss_pct || 0).toFixed(2)}% · TP ${Number(status.take_profit_pct || 0).toFixed(2)}%</td>
+                <td>SL ${Number(status.stop_loss_pct || 0).toFixed(2)}% · TP ${Number(status.take_profit_pct || 0).toFixed(2)}%<br><span class="muted">${reversePolicy}</span></td>
                 <td>${status.last_action || '-'}</td>
                 <td>${lastError}</td>
             </tr>`;

@@ -9,8 +9,9 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from strategies.base import BaseStrategy, Signal
 from config import BacktestConfig
+from strategies.base import BaseStrategy, Signal
+from strategies.btc_mtf_regime import build_regime_series, side_from_signal
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ class Trade:
     strategy: str = ""
     reason_entry: str = ""
     reason_exit: str = ""
+    break_even_armed: bool = False
 
 
 @dataclass
@@ -62,9 +64,18 @@ class BacktestResult:
     flip_on_reverse: bool = False
     allowed_sides: str = "both"
     max_hold_bars: Optional[int] = None
+    break_even_after_pct: Optional[float] = None
+    commission_rate: float = 0.0
+    slippage_rate: float = 0.0
     min_trend_gap: Optional[float] = None
     min_ema_slope: Optional[float] = None
     higher_timeframe: Optional[str] = None
+    regime_timeframe: Optional[str] = None
+    require_regime_alignment: bool = False
+    reverse_only_when_profitable: bool = False
+    min_reverse_net_pnl_usdt: float = 0.0
+    blocked_by_regime_count: int = 0
+    reverse_block_count: int = 0
     long_trades: int = 0
     short_trades: int = 0
     exit_reason_counts: Dict[str, int] = field(default_factory=dict)
@@ -90,9 +101,16 @@ class BacktestEngine:
         self.flip_on_reverse = False
         self.allowed_sides = "both"
         self.max_hold_bars: Optional[int] = None
+        self.break_even_after_pct: Optional[float] = None
         self.min_trend_gap: Optional[float] = None
         self.min_ema_slope: Optional[float] = None
         self.higher_timeframe: Optional[str] = None
+        self.regime_timeframe: Optional[str] = None
+        self.require_regime_alignment = False
+        self.reverse_only_when_profitable = False
+        self.min_reverse_net_pnl_usdt = 0.0
+        self.blocked_by_regime_count = 0
+        self.reverse_block_count = 0
 
     def run(
         self,
@@ -106,9 +124,14 @@ class BacktestEngine:
         flip_on_reverse: bool = False,
         allowed_sides: str = "both",
         max_hold_bars: Optional[int] = None,
+        break_even_after_pct: Optional[float] = None,
         min_trend_gap: Optional[float] = None,
         min_ema_slope: Optional[float] = None,
         higher_timeframe: Optional[str] = None,
+        regime_timeframe: Optional[str] = None,
+        require_regime_alignment: bool = False,
+        reverse_only_when_profitable: bool = False,
+        min_reverse_net_pnl_usdt: float = 0.0,
     ) -> BacktestResult:
         """
         백테스트 실행
@@ -124,9 +147,14 @@ class BacktestEngine:
             flip_on_reverse: 반대 신호에서 청산 후 즉시 반대 포지션 진입
             allowed_sides: "both", "long", "short" 중 하나
             max_hold_bars: 설정 시 N개 봉 이상 보유하면 시간 청산
+            break_even_after_pct: 설정 시 해당 수익률 도달 후 진입가 이탈 시 본전 청산
             min_trend_gap: 설정 시 절대 EMA gap이 이 값 미만이면 신규 진입 차단
             min_ema_slope: 설정 시 절대 EMA slope가 이 값 미만이면 신규 진입 차단
             higher_timeframe: 설정 시 해당 상위봉 EMA 방향과 같은 진입만 허용
+            regime_timeframe: 설정 시 닫힌 상위봉 regime과 같은 신호만 허용
+            require_regime_alignment: True이면 raw 신호와 regime 방향 일치 필요
+            reverse_only_when_profitable: True이면 반대 신호 청산은 순손익 기준 통과 필요
+            min_reverse_net_pnl_usdt: 반대 신호 청산/전환을 허용할 최소 순손익
 
         Returns:
             BacktestResult
@@ -140,12 +168,26 @@ class BacktestEngine:
         self.flip_on_reverse = flip_on_reverse
         self.allowed_sides = allowed_sides
         self.max_hold_bars = max_hold_bars
+        self.break_even_after_pct = break_even_after_pct
         self.min_trend_gap = min_trend_gap
         self.min_ema_slope = min_ema_slope
         self.higher_timeframe = higher_timeframe
+        self.regime_timeframe = regime_timeframe
+        self.require_regime_alignment = require_regime_alignment
+        self.reverse_only_when_profitable = reverse_only_when_profitable
+        self.min_reverse_net_pnl_usdt = min_reverse_net_pnl_usdt
+        self.blocked_by_regime_count = 0
+        self.reverse_block_count = 0
 
         # 최소 데이터 확보를 위해 50번째 봉부터 시작
         lookback = 50
+        regime_series = None
+        if regime_timeframe and require_regime_alignment:
+            regime_series = build_regime_series(
+                df,
+                regime_timeframe,
+                getattr(strategy, "config", None),
+            )
 
         for i in range(lookback, len(df)):
             window = df.iloc[: i + 1]
@@ -160,8 +202,16 @@ class BacktestEngine:
 
                 if self.position.side == "long":
                     sl_price = entry * (1 - stop_loss_pct / 100)
-                    if low <= sl_price:
+                    if not self.position.break_even_armed and low <= sl_price:
                         self._close_position(sl_price, current_time, "손절")
+                        self._update_equity(current_price, current_time)
+                        continue
+
+                    if self._should_arm_break_even(high, low, entry):
+                        self.position.break_even_armed = True
+
+                    if self.position.break_even_armed and low <= entry:
+                        self._close_position(entry, current_time, "본전 청산")
                         self._update_equity(current_price, current_time)
                         continue
 
@@ -172,8 +222,16 @@ class BacktestEngine:
                         continue
                 else:
                     sl_price = entry * (1 + stop_loss_pct / 100)
-                    if high >= sl_price:
+                    if not self.position.break_even_armed and high >= sl_price:
                         self._close_position(sl_price, current_time, "숏 손절")
+                        self._update_equity(current_price, current_time)
+                        continue
+
+                    if self._should_arm_break_even(high, low, entry):
+                        self.position.break_even_armed = True
+
+                    if self.position.break_even_armed and high >= entry:
+                        self._close_position(entry, current_time, "숏 본전 청산")
                         self._update_equity(current_price, current_time)
                         continue
 
@@ -185,6 +243,7 @@ class BacktestEngine:
 
                 if (
                     max_hold_bars is not None
+                    and max_hold_bars > 0
                     and i - self.position.entry_index >= max_hold_bars
                 ):
                     self._close_position(current_price, current_time, "시간 청산")
@@ -196,6 +255,12 @@ class BacktestEngine:
                 signal = strategy.analyze(window, symbol)
             except Exception as e:
                 logger.debug(f"분석 건너뜀 (index {i}): {e}")
+                self._update_equity(current_price, current_time)
+                continue
+
+            raw_side = side_from_signal(signal.signal)
+            if not self._passes_regime_gate(raw_side, regime_series, current_time):
+                self.blocked_by_regime_count += 1
                 self._update_equity(current_price, current_time)
                 continue
 
@@ -213,6 +278,10 @@ class BacktestEngine:
                             side="long",
                         )
                 elif self.position.side == "short":
+                    if self._blocks_reverse_close(current_price):
+                        self.reverse_block_count += 1
+                        self._update_equity(current_price, current_time)
+                        continue
                     self._close_position(current_price, current_time, signal.reason)
                     if flip_on_reverse and self._can_open_side(
                         strategy, window, "long", allow_short
@@ -228,6 +297,10 @@ class BacktestEngine:
                         )
             elif signal.signal == Signal.SELL:
                 if self.position and self.position.side == "long":
+                    if self._blocks_reverse_close(current_price):
+                        self.reverse_block_count += 1
+                        self._update_equity(current_price, current_time)
+                        continue
                     self._close_position(current_price, current_time, signal.reason)
                     if flip_on_reverse and self._can_open_side(
                         strategy, window, "short", allow_short
@@ -274,10 +347,7 @@ class BacktestEngine:
         reason: str,
         side: str = "long",
     ):
-        if side == "long":
-            entry_price = price * (1 + self.config.commission_rate)
-        else:
-            entry_price = price * (1 - self.config.commission_rate)
+        entry_price = self._entry_fill_price(price, side)
 
         notional = self.capital
         if self.position_size_usdt is not None:
@@ -285,7 +355,8 @@ class BacktestEngine:
         if notional <= 0:
             return
 
-        entry_fee = abs(entry_price - price) * (notional / entry_price)
+        amount = notional / entry_price
+        entry_fee = entry_price * amount * self.config.commission_rate
         self.position = Trade(
             entry_time=time,
             exit_time=None,
@@ -293,7 +364,7 @@ class BacktestEngine:
             side=side,
             entry_price=entry_price,
             entry_market_price=price,
-            amount=notional / entry_price,
+            amount=amount,
             notional=notional,
             entry_fee=entry_fee,
             entry_index=index,
@@ -306,30 +377,14 @@ class BacktestEngine:
         if not self.position:
             return
 
+        exit_price = self._exit_fill_price(price, self.position.side)
         if self.position.side == "long":
-            exit_price = price * (1 - self.config.commission_rate)
-            gross_pnl = (
-                price - self.position.entry_market_price
-            ) * self.position.amount
-            exit_fee = abs(price - exit_price) * self.position.amount
-            pnl = gross_pnl - self.position.entry_fee - exit_fee
-            pnl_pct = (
-                (exit_price - self.position.entry_price)
-                / self.position.entry_price
-                * 100
-            )
+            gross_pnl = (exit_price - self.position.entry_price) * self.position.amount
         else:
-            exit_price = price * (1 + self.config.commission_rate)
-            gross_pnl = (
-                self.position.entry_market_price - price
-            ) * self.position.amount
-            exit_fee = abs(exit_price - price) * self.position.amount
-            pnl = gross_pnl - self.position.entry_fee - exit_fee
-            pnl_pct = (
-                (self.position.entry_price - exit_price)
-                / self.position.entry_price
-                * 100
-            )
+            gross_pnl = (self.position.entry_price - exit_price) * self.position.amount
+        exit_fee = exit_price * self.position.amount * self.config.commission_rate
+        pnl = gross_pnl - self.position.entry_fee - exit_fee
+        pnl_pct = pnl / self.position.notional * 100 if self.position.notional else 0.0
 
         self.position.exit_time = time
         self.position.exit_price = exit_price
@@ -353,15 +408,7 @@ class BacktestEngine:
     def _update_equity(self, price: float, time: datetime):
         equity = self.capital
         if self.position:
-            if self.position.side == "long":
-                unrealized = (
-                    price - self.position.entry_market_price
-                ) * self.position.amount - self.position.entry_fee
-            else:
-                unrealized = (
-                    self.position.entry_market_price - price
-                ) * self.position.amount - self.position.entry_fee
-            equity += unrealized
+            equity += self._position_net_pnl_at(price)
         self.equity_curve.append(equity)
         self.timestamps.append(time)
 
@@ -435,6 +482,68 @@ class BacktestEngine:
             return fast > slow
         return fast < slow
 
+    def _passes_regime_gate(
+        self,
+        raw_side: str,
+        regime_series: Optional[pd.DataFrame],
+        current_time: datetime,
+    ) -> bool:
+        if not self.require_regime_alignment or raw_side not in {"LONG", "SHORT"}:
+            return True
+        if regime_series is None or regime_series.empty:
+            return False
+        try:
+            regime_side = regime_series.loc[current_time, "regime_side"]
+        except KeyError:
+            return False
+        if pd.isna(regime_side):
+            return False
+        return raw_side == str(regime_side)
+
+    def _blocks_reverse_close(self, current_price: float) -> bool:
+        if not self.reverse_only_when_profitable or not self.position:
+            return False
+        return self._position_net_pnl_at(current_price) < self.min_reverse_net_pnl_usdt
+
+    def _should_arm_break_even(self, high: float, low: float, entry: float) -> bool:
+        if (
+            not self.position
+            or self.position.break_even_armed
+            or self.break_even_after_pct is None
+            or self.break_even_after_pct <= 0
+        ):
+            return False
+        if self.position.side == "long":
+            return high >= entry * (1 + self.break_even_after_pct / 100)
+        return low <= entry * (1 - self.break_even_after_pct / 100)
+
+    def _position_net_pnl_at(self, price: float) -> float:
+        if not self.position:
+            return 0.0
+        exit_price = self._exit_fill_price(price, self.position.side)
+        if self.position.side == "long":
+            gross_pnl = (
+                exit_price - self.position.entry_price
+            ) * self.position.amount
+        else:
+            gross_pnl = (
+                self.position.entry_price - exit_price
+            ) * self.position.amount
+        exit_fee = exit_price * self.position.amount * self.config.commission_rate
+        return gross_pnl - self.position.entry_fee - exit_fee
+
+    def _entry_fill_price(self, price: float, side: str) -> float:
+        slippage = self.config.slippage_rate
+        if side == "long":
+            return price * (1 + slippage)
+        return price * (1 - slippage)
+
+    def _exit_fill_price(self, price: float, side: str) -> float:
+        slippage = self.config.slippage_rate
+        if side == "long":
+            return price * (1 - slippage)
+        return price * (1 + slippage)
+
     def _compile_result(self) -> BacktestResult:
         result = BacktestResult()
         result.initial_capital = self.config.initial_capital
@@ -442,9 +551,18 @@ class BacktestEngine:
         result.flip_on_reverse = self.flip_on_reverse
         result.allowed_sides = self.allowed_sides
         result.max_hold_bars = self.max_hold_bars
+        result.break_even_after_pct = self.break_even_after_pct
+        result.commission_rate = self.config.commission_rate
+        result.slippage_rate = self.config.slippage_rate
         result.min_trend_gap = self.min_trend_gap
         result.min_ema_slope = self.min_ema_slope
         result.higher_timeframe = self.higher_timeframe
+        result.regime_timeframe = self.regime_timeframe
+        result.require_regime_alignment = self.require_regime_alignment
+        result.reverse_only_when_profitable = self.reverse_only_when_profitable
+        result.min_reverse_net_pnl_usdt = self.min_reverse_net_pnl_usdt
+        result.blocked_by_regime_count = self.blocked_by_regime_count
+        result.reverse_block_count = self.reverse_block_count
         result.capital_deployed_per_trade = (
             self.config.initial_capital
             if self.position_size_usdt is None
@@ -536,6 +654,8 @@ class BacktestEngine:
             return "stop_loss"
         if "익절" in reason:
             return "take_profit"
+        if "본전" in reason:
+            return "break_even"
         if "시간" in reason:
             return "time_exit"
         if "종료" in reason:
@@ -560,6 +680,8 @@ class BacktestEngine:
 ╠══════════════════════════════════════════╣
 ║ 초기 자본:      ${result.initial_capital:>10.2f}              ║
 ║ 거래당 명목금액:${result.capital_deployed_per_trade:>10.2f}              ║
+║ 수수료율:       {result.commission_rate * 10000:>8.1f}bp              ║
+║ 슬리피지:       {result.slippage_rate * 10000:>8.1f}bp              ║
 ╠══════════════════════════════════════════╣
 ║ 총 수익(Net): ${result.total_pnl:>10.2f}              ║
 ║ 총 수익(Gross):${result.gross_pnl:>9.2f}              ║
@@ -576,6 +698,8 @@ class BacktestEngine:
 ╠══════════════════════════════════════════╣
 ║ Flip 진입:      {str(result.flip_on_reverse):>9s}               ║
 ║ 허용 방향:      {result.allowed_sides:>9s}               ║
+║ Regime 차단:   {result.blocked_by_regime_count:>8d}                ║
+║ Reverse 차단:  {result.reverse_block_count:>8d}                ║
 ║ 보유시간 중앙값:{result.median_hold_minutes:>8.1f}분              ║
 ║ 보유시간 평균:  {result.avg_hold_minutes:>8.1f}분              ║
 ║ 보유시간 최대:  {result.max_hold_minutes:>8.1f}분              ║

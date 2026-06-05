@@ -24,7 +24,13 @@ from config import (
     DASHBOARD_HOST,
     DASHBOARD_PORT,
     DRY_RUN,
+    LONG_SHORT_BREAK_EVEN_AFTER_PCT,
+    LONG_SHORT_MAX_HOLD_BARS,
+    LONG_SHORT_MIN_REVERSE_NET_PNL_USDT,
     LONG_SHORT_ORDER_USDT,
+    LONG_SHORT_REGIME_TIMEFRAME,
+    LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+    LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE,
     LONG_SHORT_STOP_LOSS_PCT,
     LONG_SHORT_TAKE_PROFIT_PCT,
     LONG_SHORT_TIMEFRAME,
@@ -336,8 +342,17 @@ def run_long_short_backtest():
     logger.info("백테스트 데이터: Binance USD-M Futures public OHLCV")
 
     base_config = BTCTrendLongShortConfig()
+    mtf_options = {
+        "regime_timeframe": LONG_SHORT_REGIME_TIMEFRAME,
+        "require_regime_alignment": LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+        "reverse_only_when_profitable": LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE,
+        "min_reverse_net_pnl_usdt": LONG_SHORT_MIN_REVERSE_NET_PNL_USDT,
+        "max_hold_bars": LONG_SHORT_MAX_HOLD_BARS,
+        "break_even_after_pct": LONG_SHORT_BREAK_EVEN_AFTER_PCT,
+    }
     scenarios = [
-        ("both / executor-like", base_config, {"allowed_sides": "both"}),
+        ("current: 10m/4h fee reverse", base_config, mtf_options),
+        ("baseline: raw executor-like", base_config, {"allowed_sides": "both"}),
         ("long-only", base_config, {"allowed_sides": "long"}),
         ("short-only", base_config, {"allowed_sides": "short"}),
     ]
@@ -362,15 +377,29 @@ def run_long_short_backtest():
 
     default_result = rows[0][1]
     logger.info(
-        "기본 executor-like 결과 | 총 거래 %s | 롱 %s | 숏 %s | Net PnL $%.2f",
+        "기본 MTF 결과 | 총 거래 %s | 롱 %s | 숏 %s | Net PnL $%.2f",
         default_result.total_trades,
         default_result.long_trades,
         default_result.short_trades,
         default_result.total_pnl,
     )
     print(BacktestEngine.format_result(default_result))
-    print(_format_long_short_backtest_table("방향별 결과", rows[:3]))
-    print(_format_long_short_backtest_table("실험 결과", rows[3:]))
+    print(_format_execution_assumptions())
+    print(_format_long_short_backtest_table("기본/비교 결과", rows[:4]))
+    print(_format_long_short_backtest_table("실험 결과", rows[4:]))
+    print(_format_cost_scenarios(df, symbol, base_config, mtf_options))
+    print(_format_holdout_table(df, symbol, base_config, mtf_options))
+    print(_format_walk_forward_table(df, symbol, base_config, mtf_options))
+    print(_format_parameter_robustness_table(df, symbol, base_config, mtf_options))
+    print(_format_timeframe_filter_table(df, symbol, base_config, mtf_options))
+    print(_format_period_trade_breakdown(default_result))
+    print(_format_regime_trade_breakdown(df, default_result, base_config))
+    print(_format_trade_distribution(default_result))
+    if default_result.total_trades < 30:
+        print(
+            "\n주의: 기본 MTF 결과는 거래 수가 30건 미만입니다. "
+            "testnet 관찰과 더 긴 구간 검증 전에는 생산 전략으로 보지 마세요."
+        )
 
 
 def _fetch_usdm_ohlcv_history(
@@ -435,23 +464,357 @@ def _run_long_short_backtest_case(
     df,
     symbol: str,
     config: BTCTrendLongShortConfig,
+    backtest_config=None,
     **options,
 ):
     from backtesting.engine import BacktestEngine
     from strategies import BTCTrendLongShortStrategy
 
+    run_options = dict(options)
+    stop_loss_pct = run_options.pop("stop_loss_pct", LONG_SHORT_STOP_LOSS_PCT)
+    take_profit_pct = run_options.pop("take_profit_pct", LONG_SHORT_TAKE_PROFIT_PCT)
     strategy = BTCTrendLongShortStrategy(config)
-    return BacktestEngine(BacktestConfig()).run(
+    return BacktestEngine(backtest_config or BacktestConfig()).run(
         df,
         strategy,
         symbol=symbol,
-        stop_loss_pct=LONG_SHORT_STOP_LOSS_PCT,
-        take_profit_pct=LONG_SHORT_TAKE_PROFIT_PCT,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
         allow_short=True,
         position_size_usdt=LONG_SHORT_ORDER_USDT,
         flip_on_reverse=True,
-        **options,
+        **run_options,
     )
+
+
+def _backtest_config(**overrides) -> BacktestConfig:
+    config = BacktestConfig()
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+def _format_execution_assumptions() -> str:
+    return "\n".join(
+        [
+            "",
+            "--- 실행 등가성 체크 ---",
+            f"entry_timeframe={LONG_SHORT_TIMEFRAME} closed candles only",
+            f"regime_timeframe={LONG_SHORT_REGIME_TIMEFRAME} closed regime series",
+            f"fixed_notional=${LONG_SHORT_ORDER_USDT:.2f}",
+            (
+                "reverse_guard="
+            f"{'fee-aware profitable only' if LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE else 'raw reverse'}"
+            ),
+            f"exit=tp {LONG_SHORT_TAKE_PROFIT_PCT:.2f}% / sl {LONG_SHORT_STOP_LOSS_PCT:.2f}%",
+            (
+                f"time_exit={LONG_SHORT_MAX_HOLD_BARS} bars "
+                f"on {LONG_SHORT_TIMEFRAME}"
+            ),
+            f"break_even_after={LONG_SHORT_BREAK_EVEN_AFTER_PCT:.2f}%",
+            "unmodeled=funding partial_fills latency liquidation websocket_timing",
+        ]
+    )
+
+
+def _format_cost_scenarios(
+    df,
+    symbol: str,
+    config: BTCTrendLongShortConfig,
+    options,
+) -> str:
+    base = BacktestConfig()
+    rows = []
+    for slippage_bp in (0, 2, 5, 10):
+        bt_config = _backtest_config(
+            commission_rate=base.commission_rate,
+            slippage_rate=slippage_bp / 10000,
+        )
+        result = _run_long_short_backtest_case(
+            df,
+            symbol,
+            config,
+            backtest_config=bt_config,
+            **options,
+        )
+        fee_bp = bt_config.commission_rate * 10000
+        rows.append((f"fee {fee_bp:.0f}bp slip {slippage_bp}bp", result))
+    return _format_long_short_backtest_table("비용/슬리피지 시나리오", rows)
+
+
+def _format_holdout_table(
+    df,
+    symbol: str,
+    config: BTCTrendLongShortConfig,
+    options,
+) -> str:
+    windows = _equal_time_windows(df, 3, min_rows=90)
+    if not windows:
+        return "\n--- 기간별 OOS 결과 ---\n데이터가 부족해 생략"
+
+    rows = []
+    for index, window in enumerate(windows, start=1):
+        result = _run_long_short_backtest_case(window, symbol, config, **options)
+        rows.append((f"OOS {index}/{len(windows)}", window, result))
+    return _format_window_result_table("기간별 OOS 결과", rows)
+
+
+def _format_walk_forward_table(
+    df,
+    symbol: str,
+    config: BTCTrendLongShortConfig,
+    options,
+) -> str:
+    train_rows = max(300, len(df) // 5)
+    test_rows = max(120, len(df) // 10)
+    rows = []
+    start = 0
+    while start + train_rows + test_rows <= len(df) and len(rows) < 5:
+        train = df.iloc[start : start + train_rows]
+        test = df.iloc[start + train_rows : start + train_rows + test_rows]
+        if len(test) >= 90:
+            result = _run_long_short_backtest_case(test, symbol, config, **options)
+            label = f"WF {len(rows) + 1}: {_short_date(train.index[0])}->{_short_date(test.index[-1])}"
+            rows.append((label, test, result))
+        start += test_rows
+
+    if not rows:
+        return "\n--- Walk-forward holdout ---\n데이터가 부족해 생략"
+    return _format_window_result_table(
+        "Walk-forward holdout (fixed params, test window only)",
+        rows,
+    )
+
+
+def _format_parameter_robustness_table(
+    df,
+    symbol: str,
+    config: BTCTrendLongShortConfig,
+    options,
+) -> str:
+    cases = [
+        ("default params", config, options),
+        ("ema 10/24", _long_short_config(fast_ema=10, slow_ema=24), options),
+        ("ema 14/30", _long_short_config(fast_ema=14, slow_ema=30), options),
+        ("rsi 50/50", _long_short_config(long_rsi_min=50.0, short_rsi_max=50.0), options),
+        ("rsi 54/46", _long_short_config(long_rsi_min=54.0, short_rsi_max=46.0), options),
+        ("sl/tp 1.5/3", config, dict(options, stop_loss_pct=1.5, take_profit_pct=3.0)),
+        ("sl/tp 2.5/5", config, dict(options, stop_loss_pct=2.5, take_profit_pct=5.0)),
+    ]
+    rows = [
+        (
+            name,
+            _run_long_short_backtest_case(df, symbol, case_config, **case_options),
+        )
+        for name, case_config, case_options in cases
+    ]
+    return _format_long_short_backtest_table("파라미터 민감도", rows)
+
+
+def _format_timeframe_filter_table(
+    df,
+    symbol: str,
+    config: BTCTrendLongShortConfig,
+    options,
+) -> str:
+    cases = []
+    for regime_timeframe in ("1h", "2h", "4h", "6h"):
+        cases.append(
+            (
+                f"10m/{regime_timeframe} regime",
+                dict(options, regime_timeframe=regime_timeframe, require_regime_alignment=True),
+            )
+        )
+    cases.append(
+        (
+            "1h EMA + 4h regime",
+            dict(
+                options,
+                higher_timeframe="1h",
+                regime_timeframe="4h",
+                require_regime_alignment=True,
+            ),
+        )
+    )
+    rows = [
+        (
+            name,
+            _run_long_short_backtest_case(df, symbol, config, **case_options),
+        )
+        for name, case_options in cases
+    ]
+    return _format_long_short_backtest_table("시간대 필터 비교", rows)
+
+
+def _format_period_trade_breakdown(result) -> str:
+    groups = {}
+    for trade in result.trades:
+        time = trade.exit_time or trade.entry_time
+        key = f"{time.year}-{time.month:02d}"
+        groups.setdefault(key, []).append(trade)
+    return _format_trade_group_table("월별 거래 성과", groups)
+
+
+def _format_regime_trade_breakdown(
+    df,
+    result,
+    config: BTCTrendLongShortConfig,
+) -> str:
+    from strategies.btc_mtf_regime import build_regime_series
+
+    regime = build_regime_series(df, LONG_SHORT_REGIME_TIMEFRAME, config)
+    regime_groups = {}
+    vol_groups = {}
+    volatility = df["close"].pct_change().rolling(_bars_per_day()).std()
+    vol_threshold = volatility.dropna().median()
+
+    for trade in result.trades:
+        regime_side = "UNKNOWN"
+        if trade.entry_time in regime.index:
+            value = regime.loc[trade.entry_time, "regime_side"]
+            regime_side = "UNKNOWN" if value != value else str(value)
+        regime_groups.setdefault(f"{trade.side}/{regime_side}", []).append(trade)
+
+        vol_value = volatility.get(trade.entry_time)
+        vol_key = "vol_unknown"
+        if vol_value == vol_value and vol_threshold == vol_threshold:
+            vol_key = "high_vol" if vol_value >= vol_threshold else "low_vol"
+        vol_groups.setdefault(vol_key, []).append(trade)
+
+    return "\n".join(
+        [
+            _format_trade_group_table("Regime별 거래 성과", regime_groups),
+            _format_trade_group_table("변동성별 거래 성과", vol_groups),
+        ]
+    )
+
+
+def _format_trade_distribution(result) -> str:
+    trades = result.trades
+    if not trades:
+        return "\n--- 거래 분포 ---\n거래 없음"
+
+    pnls = [trade.pnl for trade in trades]
+    wins = [pnl for pnl in pnls if pnl > 0]
+    losses = [pnl for pnl in pnls if pnl <= 0]
+    gross_profit = sum(wins)
+    best_share = result.best_trade / gross_profit * 100 if gross_profit > 0 else 0.0
+    return "\n".join(
+        [
+            "",
+            "--- 거래 분포 ---",
+            f"median_pnl=${_median(pnls):.2f}",
+            f"avg_win=${_avg(wins):.2f}",
+            f"avg_loss=${_avg(losses):.2f}",
+            f"best_trade_profit_share={best_share:.1f}%",
+            f"max_consecutive_losses={_max_consecutive_losses(trades)}",
+            f"worst_trade=${result.worst_trade:.2f}",
+        ]
+    )
+
+
+def _format_window_result_table(title: str, rows) -> str:
+    lines = [
+        "",
+        f"--- {title} ---",
+        "window                         bars    b&h% trades win%     net    maxDD     pf",
+    ]
+    for label, window, result in rows:
+        lines.append(
+            f"{label[:30]:<30} "
+            f"{len(window):>5d} "
+            f"{_buy_hold_pct(window):>7.2f} "
+            f"{result.total_trades:>6d} "
+            f"{result.win_rate:>5.1f} "
+            f"{result.total_pnl:>7.2f} "
+            f"{result.max_drawdown:>8.2f} "
+            f"{result.profit_factor:>6.2f}"
+        )
+    return "\n".join(lines)
+
+
+def _format_trade_group_table(title: str, groups) -> str:
+    lines = [
+        "",
+        f"--- {title} ---",
+        "group                 trades win%      net      avg    worst",
+    ]
+    if not groups:
+        lines.append("none                      0  0.0     0.00     0.00     0.00")
+        return "\n".join(lines)
+    for key in sorted(groups):
+        trades = groups[key]
+        pnls = [trade.pnl for trade in trades]
+        wins = sum(1 for pnl in pnls if pnl > 0)
+        lines.append(
+            f"{key[:20]:<20} "
+            f"{len(trades):>6d} "
+            f"{(wins / len(trades) * 100 if trades else 0):>5.1f} "
+            f"{sum(pnls):>8.2f} "
+            f"{_avg(pnls):>8.2f} "
+            f"{min(pnls) if pnls else 0:>8.2f}"
+        )
+    return "\n".join(lines)
+
+
+def _equal_time_windows(df, count: int, min_rows: int):
+    size = len(df) // count if count else 0
+    if size < min_rows:
+        return []
+    windows = []
+    for index in range(count):
+        start = index * size
+        end = len(df) if index == count - 1 else (index + 1) * size
+        window = df.iloc[start:end]
+        if len(window) >= min_rows:
+            windows.append(window)
+    return windows
+
+
+def _buy_hold_pct(df) -> float:
+    if df.empty:
+        return 0.0
+    return (df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100
+
+
+def _short_date(value) -> str:
+    return value.strftime("%m-%d")
+
+
+def _bars_per_day() -> int:
+    if LONG_SHORT_TIMEFRAME.endswith("m"):
+        minutes = int(LONG_SHORT_TIMEFRAME[:-1])
+        return max(1, 24 * 60 // minutes)
+    if LONG_SHORT_TIMEFRAME.endswith("h"):
+        hours = int(LONG_SHORT_TIMEFRAME[:-1])
+        return max(1, 24 // hours)
+    return 24
+
+
+def _avg(values) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _median(values) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _max_consecutive_losses(trades) -> int:
+    max_count = 0
+    current = 0
+    for trade in trades:
+        if trade.pnl <= 0:
+            current += 1
+            max_count = max(max_count, current)
+        else:
+            current = 0
+    return max_count
 
 
 def _format_long_short_backtest_table(title: str, rows) -> str:
@@ -460,7 +823,7 @@ def _format_long_short_backtest_table(title: str, rows) -> str:
         f"--- {title} ---",
         (
             "case                         trades long short "
-            "win%   gross    fees     net   med_hold exits"
+            "win%   gross    fees     net blocked rev_blk   med_hold exits"
         ),
     ]
     for name, result in rows:
@@ -476,6 +839,8 @@ def _format_long_short_backtest_table(title: str, rows) -> str:
             f"{result.gross_pnl:>8.2f} "
             f"{result.total_fees:>7.2f} "
             f"{result.total_pnl:>7.2f} "
+            f"{result.blocked_by_regime_count:>7d} "
+            f"{result.reverse_block_count:>7d} "
             f"{result.median_hold_minutes:>8.1f} "
             f"{exits}"
         )

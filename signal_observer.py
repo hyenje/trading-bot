@@ -4,14 +4,29 @@ BTC 롱/숏 시그널 관찰 모드
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List
 
 import pandas as pd
 
-from config import BTCTrendLongShortConfig, DRY_RUN, LONG_SHORT_TIMEFRAME
+from config import (
+    BTCTrendLongShortConfig,
+    DRY_RUN,
+    LONG_SHORT_REGIME_TIMEFRAME,
+    LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+    LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE,
+    LONG_SHORT_TIMEFRAME,
+)
 from exchange import BinanceExchange
 from strategies import BTCTrendLongShortStrategy, Signal
+from strategies.btc_mtf_regime import (
+    apply_regime_gate,
+    bias_from_row,
+    closed_candles,
+    compute_regime_payload,
+    side_from_signal,
+    timeframe_seconds,
+)
 
 
 class BTCSignalObserver:
@@ -26,10 +41,14 @@ class BTCSignalObserver:
     def get_status(self) -> Dict[str, Any]:
         df = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=240)
         df = self._closed_candles(df)
+        regime_df = self.exchange.fetch_ohlcv(
+            self.symbol, LONG_SHORT_REGIME_TIMEFRAME, limit=240
+        )
+        regime_df = closed_candles(regime_df, LONG_SHORT_REGIME_TIMEFRAME)
         signal_payload = self._empty_signal_payload("데이터 없음")
 
         if not df.empty:
-            signal_payload = self._build_signal_payload(df)
+            signal_payload = self._build_signal_payload(df, regime_df)
 
         return {
             "running": True,
@@ -48,13 +67,22 @@ class BTCSignalObserver:
             "timestamp": datetime.now().isoformat(),
         }
 
-    def _build_signal_payload(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def _build_signal_payload(
+        self,
+        df: pd.DataFrame,
+        regime_df: pd.DataFrame | None = None,
+    ) -> Dict[str, Any]:
         latest_signal = self.strategy.analyze(df, self.symbol)
         indicators = self.strategy.get_indicators(df)
         latest = indicators.iloc[-1]
-        bias = self._bias(latest)
+        bias = bias_from_row(latest)
+        regime_payload = compute_regime_payload(
+            regime_df if regime_df is not None else pd.DataFrame(),
+            LONG_SHORT_REGIME_TIMEFRAME,
+            self.strategy.config,
+        )
 
-        return {
+        payload = {
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "signal": latest_signal.signal.value,
@@ -69,10 +97,28 @@ class BTCSignalObserver:
             "ema_slope": self._number(latest.get("ema_slope")),
             "rsi": self._number(latest.get("rsi")),
             "trend_gap": self._number(latest.get("trend_gap")),
-            "recent_signals": self._recent_signals(df),
+            "recent_signals": self._recent_signals(
+                df, regime_payload.get("regime_side")
+            ),
+            "entry_block_reason": "",
+            "reverse_block_reason": "",
+            "reverse_policy": (
+                "profit_only"
+                if LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE
+                else "always"
+            ),
         }
+        return apply_regime_gate(
+            payload,
+            regime_payload,
+            LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+        )
 
-    def _recent_signals(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+    def _recent_signals(
+        self,
+        df: pd.DataFrame,
+        regime_side: str | None = None,
+    ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         config = self.strategy.config
         min_rows = max(config.slow_ema, config.rsi_period) + config.slope_period + 2
@@ -83,11 +129,20 @@ class BTCSignalObserver:
             signal = self.strategy.analyze(window, self.symbol)
             if signal.signal == Signal.HOLD:
                 continue
+            side = self._side(signal.signal)
+            if (
+                LONG_SHORT_REQUIRE_REGIME_ALIGNMENT
+                and regime_side
+                and side != regime_side
+            ):
+                continue
             rows.append(
                 {
                     "time": window.index[-1].isoformat(),
                     "signal": signal.signal.value,
-                    "side": self._side(signal.signal),
+                    "side": side,
+                    "regime_side": regime_side,
+                    "regime_aligned": not regime_side or side == regime_side,
                     "price": self._number(signal.price),
                     "confidence": self._number(signal.confidence),
                     "reason": signal.reason,
@@ -98,19 +153,11 @@ class BTCSignalObserver:
 
     @staticmethod
     def _bias(row: pd.Series) -> str:
-        if row["ema_fast"] > row["ema_slow"] and row["ema_slope"] > 0:
-            return "LONG_BIAS"
-        if row["ema_fast"] < row["ema_slow"] and row["ema_slope"] < 0:
-            return "SHORT_BIAS"
-        return "NEUTRAL"
+        return bias_from_row(row)
 
     @staticmethod
     def _side(signal: Signal) -> str:
-        if signal == Signal.BUY:
-            return "LONG"
-        if signal == Signal.SELL:
-            return "SHORT"
-        return "HOLD"
+        return side_from_signal(signal)
 
     def _empty_signal_payload(self, reason: str) -> Dict[str, Any]:
         return {
@@ -118,43 +165,33 @@ class BTCSignalObserver:
             "timeframe": self.timeframe,
             "signal": Signal.HOLD.value,
             "side": "HOLD",
+            "raw_signal": Signal.HOLD.value,
+            "raw_side": "HOLD",
             "bias": "NEUTRAL",
             "confidence": 0.0,
             "price": 0.0,
             "reason": reason,
             "updated_at": datetime.now().isoformat(),
+            "regime_timeframe": LONG_SHORT_REGIME_TIMEFRAME,
+            "regime_side": "NEUTRAL",
+            "regime_closed_at": None,
+            "regime_aligned": False,
+            "regime_alignment_required": LONG_SHORT_REQUIRE_REGIME_ALIGNMENT,
+            "entry_block_reason": "",
+            "reverse_policy": (
+                "profit_only"
+                if LONG_SHORT_REVERSE_ONLY_WHEN_PROFITABLE
+                else "always"
+            ),
+            "reverse_block_reason": "",
             "recent_signals": [],
         }
 
     def _closed_candles(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-
-        timeframe_seconds = self._timeframe_seconds()
-        if timeframe_seconds <= 0:
-            return df
-
-        latest = df.index[-1]
-        if getattr(latest, "tzinfo", None):
-            latest = latest.tz_convert(None)
-        close_time = latest.to_pydatetime() + timedelta(seconds=timeframe_seconds)
-        if datetime.utcnow() < close_time:
-            return df.iloc[:-1]
-        return df
+        return closed_candles(df, self.timeframe)
 
     def _timeframe_seconds(self) -> int:
-        unit = self.timeframe[-1]
-        try:
-            value = int(self.timeframe[:-1])
-        except ValueError:
-            return 0
-        if unit == "m":
-            return value * 60
-        if unit == "h":
-            return value * 60 * 60
-        if unit == "d":
-            return value * 24 * 60 * 60
-        return 0
+        return timeframe_seconds(self.timeframe)
 
     @staticmethod
     def _number(value: Any) -> float:

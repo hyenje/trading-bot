@@ -9,7 +9,8 @@ from config import BTCTrendLongShortConfig
 
 class FakeExchange:
     def fetch_ohlcv(self, symbol, timeframe, limit=240):
-        index = pd.date_range("2026-01-01", periods=limit, freq="10min")
+        freq = "4h" if timeframe == "4h" else "10min"
+        index = pd.date_range("2026-01-01", periods=limit, freq=freq)
         close = pd.Series(range(100, 100 + limit), index=index, dtype=float)
         return pd.DataFrame(
             {
@@ -47,6 +48,11 @@ class BTCSignalObserverTest(unittest.TestCase):
         self.assertIn(signal["bias"], {"LONG_BIAS", "SHORT_BIAS", "NEUTRAL"})
         self.assertIsInstance(signal["price"], float)
         self.assertIsInstance(signal["rsi"], float)
+        self.assertEqual(signal["regime_timeframe"], "4h")
+        self.assertIn(signal["regime_side"], {"LONG", "SHORT", "NEUTRAL"})
+        self.assertIn("raw_side", signal)
+        self.assertIn("entry_block_reason", signal)
+        self.assertIn("reverse_block_reason", signal)
         self.assertIn("recent_signals", signal)
 
 

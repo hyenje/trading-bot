@@ -37,7 +37,7 @@ General spot live trading is blocked unless `USE_TESTNET=false`, `DRY_RUN=false`
 # Read-only Binance futures testnet check
 ./.venv/bin/python main.py --check-futures
 
-# BTC long/short backtest using executor-like fixed notional sizing
+# BTC long/short backtest using the current 10m/4h MTF default
 ./.venv/bin/python main.py --backtest-long-short
 
 # Observe long/short signals without futures orders
@@ -54,14 +54,21 @@ http://127.0.0.1:5001
 http://127.0.0.1:5001/api/status
 ```
 
-The dashboard distinguishes signal bias from actual positions. A strategy-side
-`HOLD` with `LONG_BIAS` or `SHORT_BIAS` is displayed as `WAIT_LONG_BIAS` or
-`WAIT_SHORT_BIAS`; it is still not an open position.
+The dashboard distinguishes raw 10m signals, executable signals, 4h regime, and
+actual positions. A strategy-side `HOLD` with `LONG_BIAS` or `SHORT_BIAS` is
+displayed as `WAIT_LONG_BIAS` or `WAIT_SHORT_BIAS`; it is still not an open
+position. If the raw 10m signal does not match the 4h regime, the executable
+side remains `HOLD` and the block reason is shown in the signal card.
 
 If `LONG_SHORT_ENABLE_SIGNAL_CATCHUP=true`, the futures testnet executor may
 enter on the latest recent signal after a restart, but only when the account is
 flat, the signal is within `LONG_SHORT_MAX_SIGNAL_AGE_MINUTES`, and the current
-bias still points in the same direction. The default is `false`.
+4h regime still points in the same direction. The default is `false`.
+
+The default BTC long/short profile is `10m` entry timing with a closed `4h`
+regime filter. Reverse-signal closes/flips are held until estimated net PnL is
+at least `BTC_LS_MIN_REVERSE_NET_PNL_USDT`; stop loss, take profit, and daily
+loss safety exits still override that rule.
 
 ## Running In A Screen Session
 
@@ -87,9 +94,41 @@ No extra test dependency is required.
 
 ## Current Backtest Limits
 
-The long/short backtest now uses `LONG_SHORT_ORDER_USDT` as fixed notional sizing, closes and flips on reverse signals by default in `--backtest-long-short`, and prints long-only, short-only, and both-direction results together. The report separates gross PnL, fees, and net PnL, then summarizes exit reasons and holding time. The same command also runs a small fixed set of diagnostics for a stricter long filter, time exits, higher-timeframe trend filtering, EMA gap, and EMA slope.
+The long/short backtest uses `LONG_SHORT_ORDER_USDT` as fixed notional sizing
+and prints the current `10m/4h fee-aware reverse` strategy first, with the old
+raw executor-like result and direction-only rows kept as baselines. The report
+separates gross PnL, fees, and net PnL, then summarizes exit reasons, holding
+time, regime-blocked signals, and reverse-blocked signals. The same command
+also prints execution-assumption checks, fee/slippage stress rows, equal-period
+OOS windows, fixed-parameter walk-forward holdouts, parameter sensitivity,
+timeframe-filter comparisons, monthly PnL, regime/volatility breakdowns, and a
+trade-distribution summary.
 
-It still does not model funding, slippage, partial fills, latency, liquidation mechanics, or websocket execution timing. Treat good results as observation evidence, not production proof.
+The active baseline exit profile is `LONG_SHORT_STOP_LOSS_PCT=2.0`,
+`LONG_SHORT_TAKE_PROFIT_PCT=4.0`, `LONG_SHORT_MAX_HOLD_BARS=0`, and
+`LONG_SHORT_BREAK_EVEN_AFTER_PCT=0.0`; `0` disables the optional time-exit and
+break-even exits.
+
+It still does not model funding, dynamic order-book slippage, partial fills,
+latency, liquidation mechanics, or websocket execution timing. Treat good
+results as observation evidence, not production proof, especially while the
+current MTF profile has a small trade sample.
+
+Binance Futures testnet rejects new non-reduce-only orders below the minimum
+notional. Keep `LONG_SHORT_ORDER_USDT` above that threshold; the default example
+uses `$60` so BTCUSDT testnet entries clear the `$50` minimum.
+
+Current MTF watch points:
+
+- The current profile is the default because it cut overtrading sharply versus
+  the raw 10m executor-like baseline in the latest local backtest.
+- The main concern is sample size: the latest default result had fewer than 30
+  trades, so the win rate and profit factor can still be luck-heavy.
+- Funding is less urgent in the latest BTCUSDT window, but long multi-day holds
+  mean it should be monitored before trusting longer testnet results.
+- Constant slippage stress is modeled, but dynamic slippage and partial fills
+  are still not, so live/testnet observation matters more than another round of
+  parameter tuning.
 
 ## Log Hygiene
 

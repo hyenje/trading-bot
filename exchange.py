@@ -406,6 +406,7 @@ class BinanceFuturesExchange:
     """Binance USD-M Futures 테스트넷 래퍼"""
 
     PROTECTION_CLIENT_ID_PREFIX = "btcls-"
+    FALLBACK_MIN_NOTIONAL_USDT = 50.0
 
     def __init__(self):
         if not USE_TESTNET:
@@ -513,6 +514,13 @@ class BinanceFuturesExchange:
         return self._flat_position()
 
     def amount_from_usdt(self, symbol: str, usdt_amount: float) -> float:
+        min_notional = self.get_min_order_notional(symbol)
+        if usdt_amount < min_notional:
+            logger.warning(
+                f"Futures 주문 금액({usdt_amount})이 최소 명목금액({min_notional})보다 작습니다."
+            )
+            return 0.0
+
         ticker = self.get_ticker(symbol)
         price = ticker.get("last") if ticker else None
         if not price:
@@ -527,6 +535,16 @@ class BinanceFuturesExchange:
             )
             return 0.0
         return amount
+
+    def get_min_order_notional(self, symbol: str) -> float:
+        try:
+            market = self.exchange.market(symbol)
+            min_cost = market.get("limits", {}).get("cost", {}).get("min")
+            if min_cost:
+                return max(float(min_cost), self.FALLBACK_MIN_NOTIONAL_USDT)
+        except Exception:
+            pass
+        return self.FALLBACK_MIN_NOTIONAL_USDT
 
     def open_long(self, symbol: str, amount: float) -> Optional[Dict]:
         return self._create_market_order(symbol, "buy", amount, reduce_only=False)
