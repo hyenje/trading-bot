@@ -382,6 +382,61 @@ def select_allocation(
     return allocation, scores, True
 
 
+def build_current_allocator_signal(
+    prices: pd.DataFrame,
+    strategy_config: Optional[AllocatorStrategyConfig] = None,
+) -> Dict[str, object]:
+    strategy_config = strategy_config or tlt_stress_candidate_config()
+    prices = _clean_prices(
+        prices,
+        required_assets=strategy_config.risk_assets,
+        asset_scope=_strategy_price_assets(strategy_config),
+    )
+    asof_index = len(prices) - 1
+    allocation, scores, risk_on = select_allocation(
+        prices,
+        asof_index,
+        strategy_config=strategy_config,
+    )
+    history = prices.iloc[: asof_index + 1]
+    macro_reasons = _macro_stress_reasons(history, strategy_config)
+    if macro_reasons:
+        decision = "MACRO_STRESS_RISK_OFF"
+    elif risk_on:
+        decision = "RISK_ON"
+    else:
+        decision = "TREND_RISK_OFF"
+
+    latest = history.iloc[-1]
+    return {
+        "strategy": strategy_config.name,
+        "asof_date": history.index[-1].date().isoformat(),
+        "decision": decision,
+        "risk_on": risk_on,
+        "macro_stressed": bool(macro_reasons),
+        "macro_reasons": macro_reasons,
+        "allocation": {
+            asset: float(allocation.get(asset, 0.0))
+            for asset in ALL_ASSETS
+        },
+        "nonzero_allocation": {
+            asset: float(weight)
+            for asset, weight in allocation.items()
+            if float(weight) > 0
+        },
+        "scores": {
+            asset: float(score)
+            for asset, score in scores.items()
+            if score == score
+        },
+        "latest_prices": {
+            asset: float(latest[asset])
+            for asset in history.columns
+            if asset in PRICE_ASSETS
+        },
+    }
+
+
 def run_buy_hold(
     prices: pd.DataFrame,
     asset: str,
@@ -1289,9 +1344,17 @@ def _is_macro_stressed(
     prices: pd.DataFrame,
     strategy_config: AllocatorStrategyConfig,
 ) -> bool:
-    if strategy_config.macro_stress_mode not in ("vix", "tlt", "vix_tlt"):
-        return False
+    return bool(_macro_stress_reasons(prices, strategy_config))
 
+
+def _macro_stress_reasons(
+    prices: pd.DataFrame,
+    strategy_config: AllocatorStrategyConfig,
+) -> List[str]:
+    if strategy_config.macro_stress_mode not in ("vix", "tlt", "vix_tlt"):
+        return []
+
+    reasons: List[str] = []
     if (
         strategy_config.macro_stress_mode in ("vix", "vix_tlt")
         and "VIX" in prices.columns
@@ -1300,9 +1363,11 @@ def _is_macro_stressed(
         vix = float(prices["VIX"].iloc[-1])
         vix_sma = float(prices["VIX"].iloc[-20:].mean())
         if vix >= VIX_STRESS_LEVEL:
-            return True
+            reasons.append(f"VIX {vix:.2f} >= {VIX_STRESS_LEVEL:.2f}")
         if vix_sma > 0 and vix / vix_sma - 1 >= VIX_STRESS_RATIO:
-            return True
+            reasons.append(
+                f"VIX {vix / vix_sma - 1:.1%} above 20d average"
+            )
 
     if (
         strategy_config.macro_stress_mode in ("tlt", "vix_tlt")
@@ -1315,9 +1380,11 @@ def _is_macro_stressed(
             - 1
         )
         if tlt_return <= TLT_STRESS_RETURN and not _above_sma(prices, "TLT"):
-            return True
+            reasons.append(
+                f"TLT 90d {tlt_return:.1%} <= {TLT_STRESS_RETURN:.1%} and below 200d SMA"
+            )
 
-    return False
+    return reasons
 
 
 def _is_asset_eligible(

@@ -43,6 +43,12 @@ General spot live trading is blocked unless `USE_TESTNET=false`, `DRY_RUN=false`
 # Market regime allocator backtest using public Yahoo/Binance data
 ./.venv/bin/python main.py --backtest-allocator
 
+# Current TLT-stress allocator target allocation
+./.venv/bin/python main.py --allocator-signal
+
+# Observe allocator target allocation in the dashboard without orders
+./.venv/bin/python main.py --observe-allocator
+
 # Observe long/short signals without futures orders
 ./.venv/bin/python main.py --observe-long-short
 

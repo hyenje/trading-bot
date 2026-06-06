@@ -9,6 +9,7 @@ from backtesting.market_regime_allocator import (
     DEFENSIVE_ASSETS,
     RISK_ASSETS,
     build_candidate_benchmark_rows,
+    build_current_allocator_signal,
     build_extended_etf_rows,
     build_experiment_rows,
     build_rolling_window_rows,
@@ -380,6 +381,27 @@ class MarketRegimeAllocatorTest(unittest.TestCase):
         self.assertFalse(risk_on)
         self.assertEqual(allocation["GLD"], 1.0)
         self.assertEqual(sum(allocation[asset] for asset in RISK_ASSETS), 0.0)
+
+    def test_current_allocator_signal_contains_target_allocation(self):
+        prices = trend_prices_with_defensive(
+            {
+                "SPY": 0.001,
+                "QQQ": 0.002,
+                "BTC": 0.003,
+                "ETH": 0.002,
+                "GLD": 0.001,
+                "TLT": -0.001,
+                "SHY": 0.0001,
+                "BIL": 0.0001,
+            }
+        )
+
+        signal = build_current_allocator_signal(prices)
+
+        self.assertEqual(signal["strategy"], "tlt stress riskoff")
+        self.assertIn(signal["decision"], {"RISK_ON", "TREND_RISK_OFF", "MACRO_STRESS_RISK_OFF"})
+        self.assertIn("nonzero_allocation", signal)
+        self.assertAlmostEqual(sum(signal["allocation"].values()), 1.0)
 
 
 if __name__ == "__main__":

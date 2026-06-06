@@ -60,6 +60,16 @@ def parse_args():
         help="시장 Regime Allocator 백테스팅 실행",
     )
     mode_group.add_argument(
+        "--allocator-signal",
+        action="store_true",
+        help="시장 Regime Allocator 현재 목표 비중 조회",
+    )
+    mode_group.add_argument(
+        "--observe-allocator",
+        action="store_true",
+        help="시장 Regime Allocator 관찰 대시보드 실행",
+    )
+    mode_group.add_argument(
         "--observe-long-short",
         action="store_true",
         help="BTC 롱/숏 시그널 관찰 대시보드 실행",
@@ -169,6 +179,27 @@ def run_long_short_trader():
     set_bot(executor)
     logging.getLogger(__name__).info(
         f"롱/숏 테스트넷 주문 대시보드 시작 → http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
+    )
+    run_dashboard()
+
+
+def run_allocator_signal():
+    """시장 Regime Allocator 현재 목표 비중 조회"""
+    from allocator_observer import AllocatorObserver, format_allocator_signal
+
+    observer = AllocatorObserver()
+    print(format_allocator_signal(observer.get_signal()))
+
+
+def run_allocator_observer():
+    """시장 Regime Allocator 관찰 대시보드 실행"""
+    from allocator_observer import AllocatorObserver
+    from dashboard.app import run_dashboard, set_bot
+
+    observer = AllocatorObserver()
+    set_bot(observer)
+    logging.getLogger(__name__).info(
+        f"Allocator 관찰 대시보드 시작 → http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
     )
     run_dashboard()
 
@@ -901,6 +932,10 @@ def main():
         run_long_short_backtest()
     elif args.backtest_allocator:
         run_allocator_backtest()
+    elif args.allocator_signal:
+        run_allocator_signal()
+    elif args.observe_allocator:
+        run_allocator_observer()
     elif args.trade_long_short:
         run_long_short_trader()
     elif args.observe_long_short:

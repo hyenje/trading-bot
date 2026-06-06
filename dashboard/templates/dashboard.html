@@ -109,6 +109,14 @@
             <div id="equity-chart" style="height: 350px;"></div>
         </div>
 
+        <div class="card" id="allocator-card" style="display:none; margin-bottom: 24px;">
+            <div class="section-title">시장 Regime Allocator</div>
+            <table>
+                <thead><tr><th>전략</th><th>판정</th><th>목표 비중</th><th>Macro Stress</th><th>기준일</th><th>업데이트</th><th>오류</th></tr></thead>
+                <tbody id="allocator-table"></tbody>
+            </table>
+        </div>
+
         <div class="signal-grid" id="signal-section" style="display:none;">
             <div class="card">
                 <div class="card-label">BTC 전략 신호</div>
@@ -261,6 +269,35 @@
             if (signal.bias === 'LONG_BIAS') return 'WAIT_LONG_BIAS';
             if (signal.bias === 'SHORT_BIAS') return 'WAIT_SHORT_BIAS';
             return side;
+        }
+
+        function renderAllocatorSignal(signal) {
+            const card = document.getElementById('allocator-card');
+            const table = document.getElementById('allocator-table');
+            if (!signal) {
+                card.style.display = 'none';
+                return;
+            }
+
+            card.style.display = 'block';
+            const allocation = signal.nonzero_allocation || {};
+            const allocationText = Object.entries(allocation)
+                .map(([asset, weight]) => `${asset} ${(Number(weight || 0) * 100).toFixed(0)}%`)
+                .join(' · ') || 'cash 100%';
+            const decision = signal.decision || 'HOLD';
+            const decisionClass = decision.includes('RISK_ON') ? 'tag-long' :
+                (decision.includes('RISK_OFF') ? 'tag-hold' : 'tag-short');
+            const macroReasons = (signal.macro_reasons || []).join(' · ') || '-';
+            const stressText = signal.macro_stressed ? `YES · ${macroReasons}` : 'NO';
+            table.innerHTML = `<tr>
+                <td>${signal.strategy || '-'}</td>
+                <td><span class="tag ${decisionClass}">${decision}</span></td>
+                <td>${allocationText}</td>
+                <td>${stressText}</td>
+                <td>${signal.asof_date || '-'}</td>
+                <td>${signal.updated_at || '-'}</td>
+                <td>${signal.error || '-'}</td>
+            </tr>`;
         }
 
         function renderLongShortSignal(signal) {
@@ -431,6 +468,7 @@
             renderPositions(data.positions || []);
             renderTrades(data.recent_trades || []);
             renderEquityChart(data.equity_curve || []);
+            renderAllocatorSignal(data.allocator_signal);
             renderLongShortSignal(data.long_short_signal);
             renderExecutor(data.executor_status);
         }
