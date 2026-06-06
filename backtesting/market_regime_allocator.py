@@ -467,6 +467,7 @@ def build_allocator_report(
         prices,
         initial_capital=initial_capital,
         start_date=start_date,
+        strategy_config=tlt_stress_candidate_config(),
     )
     benchmarks = {
         asset: run_buy_hold(
@@ -560,7 +561,7 @@ def _metric_row(result: PortfolioResult) -> Dict[str, float]:
 def format_allocator_report(report: AllocatorReport) -> str:
     lines = [
         "",
-        "=== Market Regime Allocator v1 ===",
+        f"=== Market Regime Allocator: {report.allocator.name} ===",
         (
             f"Data: {report.prices.index[0].date()} -> "
             f"{report.prices.index[-1].date()} ({len(report.prices)} trading days)"
@@ -569,7 +570,11 @@ def format_allocator_report(report: AllocatorReport) -> str:
             "Sources: Yahoo Finance adjusted close "
             "(SPY/QQQ/GLD/TLT/SHY/BIL/VIX), Binance public daily OHLCV (BTC/ETH)"
         ),
-        "Rules: weekly rebalance, SPY > 200d SMA risk-on, score=0.6*90d+0.4*180d",
+        (
+            "Rules: weekly rebalance, SPY > 200d SMA risk-on, "
+            "score=0.6*90d+0.4*180d, force defensive when TLT 90d <= -7% "
+            "and TLT < 200d SMA"
+        ),
         f"Cost: {REBALANCE_FEE_RATE * 100:.2f}% on changed risky notional",
         "",
         "--- Performance ---",
@@ -1018,6 +1023,7 @@ def allocator_experiment_configs() -> List[AllocatorStrategyConfig]:
             max_single_asset=0.6,
         ),
         riskoff_defensive_candidate_config(),
+        tlt_stress_candidate_config(),
         AllocatorStrategyConfig(
             name="combo defensive",
             score_mode="vol_adjusted",
