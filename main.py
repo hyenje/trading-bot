@@ -411,7 +411,9 @@ def run_allocator_backtest():
     """시장 Regime Allocator 백테스팅 실행"""
     from backtesting.market_regime_allocator import (
         DEFAULT_DAYS,
+        EXTENDED_VALIDATION_DAYS,
         build_allocator_report,
+        fetch_extended_etf_prices,
         fetch_market_regime_prices,
         format_allocator_report,
     )
@@ -421,11 +423,13 @@ def run_allocator_backtest():
     logger.info("백테스트 데이터: Yahoo Finance adjusted close + Binance public OHLCV")
 
     try:
-        prices = fetch_market_regime_prices(days=DEFAULT_DAYS)
+        validation_prices = fetch_market_regime_prices(days=EXTENDED_VALIDATION_DAYS)
+        extended_etf_prices = fetch_extended_etf_prices()
         report = build_allocator_report(
-            prices,
+            validation_prices,
             initial_capital=BacktestConfig().initial_capital,
             days=DEFAULT_DAYS,
+            extended_etf_prices=extended_etf_prices,
         )
     except Exception as e:
         logger.error(f"Allocator 백테스팅 실패: {mask_sensitive(e)}")

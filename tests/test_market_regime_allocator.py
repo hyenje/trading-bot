@@ -8,8 +8,12 @@ from backtesting.market_regime_allocator import (
     AllocatorStrategyConfig,
     DEFENSIVE_ASSETS,
     RISK_ASSETS,
+    build_candidate_benchmark_rows,
+    build_extended_etf_rows,
     build_experiment_rows,
     build_rolling_window_rows,
+    build_stress_period_rows,
+    build_walk_forward_rows,
     run_allocator_backtest,
     select_allocation,
 )
@@ -297,6 +301,59 @@ class MarketRegimeAllocatorTest(unittest.TestCase):
         self.assertTrue(all(row["windows"] > 0 for row in rows))
         self.assertTrue(all(0.0 <= row["win_spy_pct"] <= 100.0 for row in rows))
         self.assertTrue(all("worst_vs_spy" in row for row in rows))
+
+    def test_validation_sections_return_rows(self):
+        prices = trend_prices_with_defensive(
+            {
+                "SPY": 0.0005,
+                "QQQ": 0.0007,
+                "BTC": 0.001,
+                "ETH": 0.0008,
+                "GLD": 0.0003,
+                "TLT": 0.0001,
+                "SHY": 0.0001,
+                "BIL": 0.0001,
+            },
+            rows=1800,
+        )
+        prices.index = pd.date_range("2017-01-02", periods=len(prices), freq="B")
+
+        benchmark_rows = build_candidate_benchmark_rows(
+            prices,
+            initial_capital=10000.0,
+            days=365,
+        )
+        stress_rows = build_stress_period_rows(prices, initial_capital=10000.0)
+        walk_forward_rows = build_walk_forward_rows(
+            prices,
+            initial_capital=10000.0,
+            start_year=2018,
+        )
+
+        self.assertIn("riskoff defensive top1", [row["name"] for row in benchmark_rows])
+        self.assertIn("simple monthly momentum", [row["name"] for row in benchmark_rows])
+        self.assertTrue(any(row["label"] == "2020 COVID crash" for row in stress_rows))
+        self.assertTrue(any(row["year"] == 2022 for row in walk_forward_rows))
+
+    def test_extended_etf_rows_do_not_require_crypto_prices(self):
+        prices = trend_prices_with_defensive(
+            {
+                "SPY": 0.0005,
+                "QQQ": 0.0007,
+                "BTC": 0.001,
+                "ETH": 0.0008,
+                "GLD": 0.0003,
+                "TLT": 0.0001,
+                "SHY": 0.0001,
+                "BIL": 0.0001,
+            },
+            rows=620,
+        ).drop(columns=["BTC", "ETH"])
+
+        rows = build_extended_etf_rows(prices, initial_capital=10000.0)
+
+        self.assertIn("ETF riskoff defensive", [row["name"] for row in rows])
+        self.assertIn("ETF monthly momentum", [row["name"] for row in rows])
 
 
 if __name__ == "__main__":

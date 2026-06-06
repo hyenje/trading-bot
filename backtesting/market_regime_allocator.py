@@ -19,17 +19,26 @@ TRADABLE_ASSETS = RISK_ASSETS + DEFENSIVE_ASSETS
 ALL_ASSETS = TRADABLE_ASSETS + ("cash",)
 CRYPTO_ASSETS = ("BTC", "ETH")
 DEFAULT_DAYS = 1095
+EXTENDED_VALIDATION_DAYS = 3300
 LOOKBACK_DAYS = 365
 REBALANCE_FEE_RATE = 0.001
 MOMENTUM_FAST_DAYS = 90
 MOMENTUM_SLOW_DAYS = 180
 SPY_SMA_DAYS = 200
 VOL_LOOKBACK_DAYS = 60
+EXTENDED_ETF_START = "2010-01-01"
+STRESS_PERIODS = (
+    ("2018 Q4 risk-off", "2018-09-01", "2018-12-31"),
+    ("2020 COVID crash", "2020-02-01", "2020-04-30"),
+    ("2022 inflation bear", "2022-01-01", "2022-12-31"),
+)
 
 
 @dataclass
 class AllocatorStrategyConfig:
     name: str = "v1 weekly top2"
+    risk_assets: Tuple[str, ...] = RISK_ASSETS
+    defensive_assets: Tuple[str, ...] = DEFENSIVE_ASSETS
     score_mode: str = "momentum"
     risk_mode: str = "spy_200"
     asset_trend_filter: bool = False
@@ -102,6 +111,10 @@ class AllocatorReport:
     experiment_rows: List[Dict[str, float]] = field(default_factory=list)
     recent_experiment_rows: List[Dict[str, float]] = field(default_factory=list)
     rolling_window_rows: List[Dict[str, float]] = field(default_factory=list)
+    candidate_benchmark_rows: List[Dict[str, float]] = field(default_factory=list)
+    stress_period_rows: List[Dict[str, float]] = field(default_factory=list)
+    walk_forward_rows: List[Dict[str, float]] = field(default_factory=list)
+    extended_etf_rows: List[Dict[str, float]] = field(default_factory=list)
 
 
 def fetch_market_regime_prices(days: int = DEFAULT_DAYS) -> pd.DataFrame:
@@ -122,6 +135,25 @@ def fetch_market_regime_prices(days: int = DEFAULT_DAYS) -> pd.DataFrame:
     if len(prices) <= SPY_SMA_DAYS:
         raise RuntimeError(
             f"Not enough aligned daily data: {len(prices)} rows after inner join"
+        )
+    return prices
+
+
+def fetch_extended_etf_prices(start: str = EXTENDED_ETF_START) -> pd.DataFrame:
+    end = pd.Timestamp.utcnow().normalize() + pd.Timedelta(days=1)
+    start_ts = pd.Timestamp(start)
+    series = {
+        "SPY": fetch_yahoo_adjusted_close("SPY", start_ts, end),
+        "QQQ": fetch_yahoo_adjusted_close("QQQ", start_ts, end),
+        "GLD": fetch_yahoo_adjusted_close("GLD", start_ts, end),
+        "TLT": fetch_yahoo_adjusted_close("TLT", start_ts, end),
+        "SHY": fetch_yahoo_adjusted_close("SHY", start_ts, end),
+        "BIL": fetch_yahoo_adjusted_close("BIL", start_ts, end),
+    }
+    prices = pd.DataFrame(series).sort_index().dropna()
+    if len(prices) <= SPY_SMA_DAYS:
+        raise RuntimeError(
+            f"Not enough aligned ETF data: {len(prices)} rows after inner join"
         )
     return prices
 
@@ -219,8 +251,12 @@ def run_allocator_backtest(
     end_date: Optional[pd.Timestamp] = None,
     strategy_config: Optional[AllocatorStrategyConfig] = None,
 ) -> PortfolioResult:
-    prices = _clean_prices(prices)
     strategy_config = strategy_config or AllocatorStrategyConfig()
+    prices = _clean_prices(
+        prices,
+        required_assets=strategy_config.risk_assets,
+        asset_scope=_strategy_price_assets(strategy_config),
+    )
     start_i, end_i = _date_window(prices, start_date, end_date)
     allocation = _cash_allocation()
     equity = float(initial_capital)
@@ -305,8 +341,12 @@ def select_allocation(
     asof_index: int,
     strategy_config: Optional[AllocatorStrategyConfig] = None,
 ) -> Tuple[Dict[str, float], Dict[str, float], bool]:
-    prices = _clean_prices(prices)
     strategy_config = strategy_config or AllocatorStrategyConfig()
+    prices = _clean_prices(
+        prices,
+        required_assets=strategy_config.risk_assets,
+        asset_scope=_strategy_price_assets(strategy_config),
+    )
     if asof_index < max(MOMENTUM_SLOW_DAYS, SPY_SMA_DAYS):
         return _cash_allocation(), {}, False
 
@@ -336,7 +376,11 @@ def run_buy_hold(
     start_date: Optional[pd.Timestamp] = None,
     end_date: Optional[pd.Timestamp] = None,
 ) -> PortfolioResult:
-    prices = _clean_prices(prices)
+    prices = _clean_prices(
+        prices,
+        required_assets=(asset,),
+        asset_scope=TRADABLE_ASSETS,
+    )
     start_i, end_i = _date_window(prices, start_date, end_date)
     returns = prices[asset].pct_change().iloc[start_i : end_i + 1]
     equity_curve = initial_capital * (1 + returns).cumprod()
@@ -360,10 +404,49 @@ def run_buy_hold(
     )
 
 
+def run_static_allocation(
+    prices: pd.DataFrame,
+    weights: Dict[str, float],
+    name: str,
+    initial_capital: float,
+    start_date: Optional[pd.Timestamp] = None,
+    end_date: Optional[pd.Timestamp] = None,
+) -> PortfolioResult:
+    prices = _clean_prices(
+        prices,
+        required_assets=tuple(weights.keys()),
+        asset_scope=TRADABLE_ASSETS,
+    )
+    start_i, end_i = _date_window(prices, start_date, end_date)
+    returns = prices[list(weights.keys())].pct_change().iloc[start_i : end_i + 1]
+    portfolio_returns = returns.mul(pd.Series(weights)).sum(axis=1)
+    equity_curve = initial_capital * (1 + portfolio_returns).cumprod()
+    allocation = _cash_allocation()
+    for asset, weight in weights.items():
+        allocation[asset] = float(weight)
+    allocation["cash"] = max(0.0, 1.0 - sum(weights.values()))
+    allocations = pd.DataFrame(
+        [allocation.copy() for _ in range(len(equity_curve))],
+        index=equity_curve.index,
+        columns=ALL_ASSETS,
+    )
+    return PortfolioResult(
+        name=name,
+        initial_capital=float(initial_capital),
+        start_date=prices.index[start_i],
+        end_date=prices.index[end_i],
+        equity_curve=equity_curve.rename(name),
+        daily_returns=portfolio_returns.rename(f"{name}_returns"),
+        allocations=allocations,
+        asset_week_counts=_asset_week_counts(allocations),
+    )
+
+
 def build_allocator_report(
     prices: pd.DataFrame,
     initial_capital: float,
     days: int = DEFAULT_DAYS,
+    extended_etf_prices: Optional[pd.DataFrame] = None,
 ) -> AllocatorReport:
     prices = _clean_prices(prices)
     start_date = prices.index[-1] - pd.Timedelta(days=days)
@@ -401,6 +484,19 @@ def build_allocator_report(
             initial_capital,
             start_date=start_date,
         ),
+        candidate_benchmark_rows=build_candidate_benchmark_rows(
+            prices,
+            initial_capital,
+            days,
+        ),
+        stress_period_rows=build_stress_period_rows(prices, initial_capital),
+        walk_forward_rows=build_walk_forward_rows(prices, initial_capital),
+        extended_etf_rows=build_extended_etf_rows(
+            extended_etf_prices,
+            initial_capital,
+        )
+        if extended_etf_prices is not None
+        else [],
     )
 
 
@@ -432,6 +528,20 @@ def calculate_metrics(result: PortfolioResult) -> PerformanceMetrics:
         final_equity=final_equity,
         turnover=result.turnover,
     )
+
+
+def _metric_row(result: PortfolioResult) -> Dict[str, float]:
+    metric = calculate_metrics(result)
+    return {
+        "name": result.name,
+        "start": result.start_date.date().isoformat(),
+        "end": result.end_date.date().isoformat(),
+        "total": metric.total_return_pct,
+        "cagr": metric.cagr_pct,
+        "maxdd": metric.max_drawdown_pct,
+        "sharpe": metric.sharpe,
+        "final_eq": metric.final_equity,
+    }
 
 
 def format_allocator_report(report: AllocatorReport) -> str:
@@ -506,6 +616,12 @@ def format_allocator_report(report: AllocatorReport) -> str:
         _format_experiment_rows("Recent 1Y Variants", report.recent_experiment_rows)
     )
     lines.extend(_format_rolling_window_rows(report.rolling_window_rows))
+    lines.extend(
+        _format_candidate_benchmark_rows(report.candidate_benchmark_rows)
+    )
+    lines.extend(_format_stress_period_rows(report.stress_period_rows))
+    lines.extend(_format_walk_forward_rows(report.walk_forward_rows))
+    lines.extend(_format_extended_etf_rows(report.extended_etf_rows))
     return "\n".join(lines)
 
 
@@ -577,6 +693,195 @@ def build_rolling_window_rows(
     return rows
 
 
+def build_candidate_benchmark_rows(
+    prices: pd.DataFrame,
+    initial_capital: float,
+    days: int,
+) -> List[Dict[str, float]]:
+    prices = _clean_prices(prices)
+    start_date = prices.index[-1] - pd.Timedelta(days=days)
+    results = [
+        run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            strategy_config=riskoff_defensive_candidate_config(),
+        ),
+        run_buy_hold(prices, "SPY", initial_capital, start_date=start_date),
+        run_buy_hold(prices, "QQQ", initial_capital, start_date=start_date),
+        run_buy_hold(prices, "BTC", initial_capital, start_date=start_date),
+        run_static_allocation(
+            prices,
+            {"SPY": 0.6, "TLT": 0.4},
+            "60/40 SPY/TLT",
+            initial_capital,
+            start_date=start_date,
+        ),
+        run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            strategy_config=monthly_momentum_config(),
+        ),
+    ]
+    return [_metric_row(result) for result in results]
+
+
+def build_stress_period_rows(
+    prices: pd.DataFrame,
+    initial_capital: float,
+) -> List[Dict[str, float]]:
+    prices = _clean_prices(prices)
+    rows = []
+    for label, start, end in STRESS_PERIODS:
+        start_date = pd.Timestamp(start)
+        end_date = pd.Timestamp(end)
+        if end_date < prices.index[0] or start_date > prices.index[-1]:
+            continue
+        candidate = run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_config=riskoff_defensive_candidate_config(),
+        )
+        spy = run_buy_hold(
+            prices,
+            "SPY",
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        btc = run_buy_hold(
+            prices,
+            "BTC",
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        sixty_forty = run_static_allocation(
+            prices,
+            {"SPY": 0.6, "TLT": 0.4},
+            "60/40 SPY/TLT",
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        candidate_metric = calculate_metrics(candidate)
+        rows.append(
+            {
+                "label": label,
+                "start": candidate.start_date.date().isoformat(),
+                "end": candidate.end_date.date().isoformat(),
+                "candidate": candidate_metric.total_return_pct,
+                "spy": calculate_metrics(spy).total_return_pct,
+                "btc": calculate_metrics(btc).total_return_pct,
+                "sixty_forty": calculate_metrics(sixty_forty).total_return_pct,
+                "candidate_maxdd": candidate_metric.max_drawdown_pct,
+                "candidate_sharpe": candidate_metric.sharpe,
+            }
+        )
+    return rows
+
+
+def build_walk_forward_rows(
+    prices: pd.DataFrame,
+    initial_capital: float,
+    start_year: int = 2018,
+) -> List[Dict[str, float]]:
+    prices = _clean_prices(prices)
+    rows = []
+    final_year = prices.index[-1].year
+    for year in range(start_year, final_year + 1):
+        start_date = pd.Timestamp(year=year, month=1, day=1)
+        end_date = pd.Timestamp(year=year, month=12, day=31)
+        if end_date < prices.index[0] or start_date > prices.index[-1]:
+            continue
+        candidate = run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_config=riskoff_defensive_candidate_config(),
+        )
+        if len(candidate.equity_curve) < 20:
+            continue
+        spy = run_buy_hold(
+            prices,
+            "SPY",
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        btc = run_buy_hold(
+            prices,
+            "BTC",
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        sixty_forty = run_static_allocation(
+            prices,
+            {"SPY": 0.6, "TLT": 0.4},
+            "60/40 SPY/TLT",
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        candidate_metric = calculate_metrics(candidate)
+        spy_total = calculate_metrics(spy).total_return_pct
+        rows.append(
+            {
+                "year": year,
+                "start": candidate.start_date.date().isoformat(),
+                "end": candidate.end_date.date().isoformat(),
+                "candidate": candidate_metric.total_return_pct,
+                "spy": spy_total,
+                "btc": calculate_metrics(btc).total_return_pct,
+                "sixty_forty": calculate_metrics(sixty_forty).total_return_pct,
+                "vs_spy": candidate_metric.total_return_pct - spy_total,
+                "candidate_maxdd": candidate_metric.max_drawdown_pct,
+            }
+        )
+    return rows
+
+
+def build_extended_etf_rows(
+    prices: pd.DataFrame,
+    initial_capital: float,
+) -> List[Dict[str, float]]:
+    prices = _clean_prices(
+        prices,
+        required_assets=("SPY", "QQQ"),
+        asset_scope=("SPY", "QQQ", "GLD", "TLT", "SHY", "BIL"),
+    )
+    start_date = prices.index[max(MOMENTUM_SLOW_DAYS, SPY_SMA_DAYS) + 1]
+    results = [
+        run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            strategy_config=etf_riskoff_defensive_config(),
+        ),
+        run_buy_hold(prices, "SPY", initial_capital, start_date=start_date),
+        run_buy_hold(prices, "QQQ", initial_capital, start_date=start_date),
+        run_static_allocation(
+            prices,
+            {"SPY": 0.6, "TLT": 0.4},
+            "60/40 SPY/TLT",
+            initial_capital,
+            start_date=start_date,
+        ),
+        run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            strategy_config=etf_monthly_momentum_config(),
+        ),
+    ]
+    return [_metric_row(result) for result in results]
+
+
 def build_experiment_rows(
     prices: pd.DataFrame,
     initial_capital: float,
@@ -644,11 +949,7 @@ def allocator_experiment_configs() -> List[AllocatorStrategyConfig]:
             max_crypto_weight=0.4,
             max_single_asset=0.6,
         ),
-        AllocatorStrategyConfig(
-            name="riskoff defensive top1",
-            score_mode="vol_adjusted",
-            defensive_mode="top1",
-        ),
+        riskoff_defensive_candidate_config(),
         AllocatorStrategyConfig(
             name="combo defensive",
             score_mode="vol_adjusted",
@@ -662,6 +963,46 @@ def allocator_experiment_configs() -> List[AllocatorStrategyConfig]:
             defensive_mode="top2_equal",
         ),
     ]
+
+
+def riskoff_defensive_candidate_config() -> AllocatorStrategyConfig:
+    return AllocatorStrategyConfig(
+        name="riskoff defensive top1",
+        score_mode="vol_adjusted",
+        defensive_mode="top1",
+    )
+
+
+def monthly_momentum_config() -> AllocatorStrategyConfig:
+    return AllocatorStrategyConfig(
+        name="simple monthly momentum",
+        risk_assets=TRADABLE_ASSETS,
+        defensive_assets=(),
+        risk_mode="always_on",
+        weighting="top1",
+        rebalance="monthly",
+    )
+
+
+def etf_riskoff_defensive_config() -> AllocatorStrategyConfig:
+    return AllocatorStrategyConfig(
+        name="ETF riskoff defensive",
+        risk_assets=("SPY", "QQQ"),
+        defensive_assets=("GLD", "TLT", "SHY", "BIL"),
+        score_mode="vol_adjusted",
+        defensive_mode="top1",
+    )
+
+
+def etf_monthly_momentum_config() -> AllocatorStrategyConfig:
+    return AllocatorStrategyConfig(
+        name="ETF monthly momentum",
+        risk_assets=("SPY", "QQQ", "GLD", "TLT", "SHY", "BIL"),
+        defensive_assets=(),
+        risk_mode="always_on",
+        weighting="top1",
+        rebalance="monthly",
+    )
 
 
 def _format_experiment_rows(title: str, rows: List[Dict[str, float]]) -> List[str]:
@@ -710,12 +1051,101 @@ def _format_rolling_window_rows(rows: List[Dict[str, float]]) -> List[str]:
     return lines
 
 
+def _format_candidate_benchmark_rows(rows: List[Dict[str, float]]) -> List[str]:
+    lines = [
+        "",
+        "--- Candidate Benchmarks ---",
+        "case                    total%   CAGR%   maxDD%  Sharpe final_eq",
+    ]
+    for row in rows:
+        lines.append(
+            f"{row['name'][:22]:<22} "
+            f"{row['total']:>7.2f} "
+            f"{row['cagr']:>7.2f} "
+            f"{row['maxdd']:>7.2f} "
+            f"{row['sharpe']:>7.2f} "
+            f"{row['final_eq']:>8.2f}"
+        )
+    return lines
+
+
+def _format_stress_period_rows(rows: List[Dict[str, float]]) -> List[str]:
+    lines = [
+        "",
+        "--- Stress Regimes ---",
+        "period                  window                  candidate    SPY    BTC  60/40  candDD Sharpe",
+    ]
+    if not rows:
+        lines.append("not enough data")
+        return lines
+    for row in rows:
+        window = f"{row['start']}->{row['end']}"
+        lines.append(
+            f"{row['label'][:22]:<22} "
+            f"{window:<22} "
+            f"{row['candidate']:>9.2f} "
+            f"{row['spy']:>6.2f} "
+            f"{row['btc']:>6.2f} "
+            f"{row['sixty_forty']:>6.2f} "
+            f"{row['candidate_maxdd']:>7.2f} "
+            f"{row['candidate_sharpe']:>6.2f}"
+        )
+    return lines
+
+
+def _format_walk_forward_rows(rows: List[Dict[str, float]]) -> List[str]:
+    lines = [
+        "",
+        "--- Fixed-Parameter Walk-Forward ---",
+        "year window                  candidate    SPY    BTC  60/40   vsSPY  candDD",
+    ]
+    if not rows:
+        lines.append("not enough data")
+        return lines
+    for row in rows:
+        window = f"{row['start']}->{row['end']}"
+        lines.append(
+            f"{int(row['year']):>4d} "
+            f"{window:<22} "
+            f"{row['candidate']:>9.2f} "
+            f"{row['spy']:>6.2f} "
+            f"{row['btc']:>6.2f} "
+            f"{row['sixty_forty']:>6.2f} "
+            f"{row['vs_spy']:>7.2f} "
+            f"{row['candidate_maxdd']:>7.2f}"
+        )
+    return lines
+
+
+def _format_extended_etf_rows(rows: List[Dict[str, float]]) -> List[str]:
+    lines = [
+        "",
+        "--- Extended ETF History ---",
+        "case                    start       end         total%   CAGR%   maxDD%  Sharpe final_eq",
+    ]
+    if not rows:
+        lines.append("not enough data")
+        return lines
+    for row in rows:
+        lines.append(
+            f"{row['name'][:22]:<22} "
+            f"{row['start']:<10} "
+            f"{row['end']:<10} "
+            f"{row['total']:>7.2f} "
+            f"{row['cagr']:>7.2f} "
+            f"{row['maxdd']:>7.2f} "
+            f"{row['sharpe']:>7.2f} "
+            f"{row['final_eq']:>8.2f}"
+        )
+    return lines
+
+
 def _momentum_scores(
     prices: pd.DataFrame,
     strategy_config: AllocatorStrategyConfig,
 ) -> Dict[str, float]:
     scores = {}
-    for asset in RISK_ASSETS:
+    for asset in strategy_config.risk_assets:
         series = prices[asset]
         ret_90 = series.iloc[-1] / series.iloc[-(MOMENTUM_FAST_DAYS + 1)] - 1
         ret_180 = series.iloc[-1] / series.iloc[-(MOMENTUM_SLOW_DAYS + 1)] - 1
@@ -732,12 +1162,20 @@ def _is_risk_on(
     prices: pd.DataFrame,
     strategy_config: AllocatorStrategyConfig,
 ) -> bool:
+    if strategy_config.risk_mode == "always_on":
+        return True
     if strategy_config.risk_mode == "spy_qqq_200":
         return _above_sma(prices, "SPY") and _above_sma(prices, "QQQ")
     if strategy_config.risk_mode == "breadth_2":
-        return sum(1 for asset in RISK_ASSETS if _above_sma(prices, asset)) >= 2
+        return (
+            sum(1 for asset in strategy_config.risk_assets if _above_sma(prices, asset))
+            >= 2
+        )
     if strategy_config.risk_mode == "breadth_3":
-        return sum(1 for asset in RISK_ASSETS if _above_sma(prices, asset)) >= 3
+        return (
+            sum(1 for asset in strategy_config.risk_assets if _above_sma(prices, asset))
+            >= 3
+        )
     return _above_sma(prices, "SPY")
 
 
@@ -757,7 +1195,10 @@ def _build_target_allocation(
 ) -> Dict[str, float]:
     allocation = _cash_allocation()
     selected = positive[:2]
-    if len(selected) >= 2:
+    if selected and strategy_config.weighting == "top1":
+        allocation[selected[0][0]] = 1.0
+        allocation["cash"] = 0.0
+    elif len(selected) >= 2:
         if strategy_config.weighting == "score_weighted":
             total_score = sum(score for _, score in selected)
             for asset, score in selected:
@@ -779,7 +1220,7 @@ def _defensive_allocation(
     if strategy_config.defensive_mode == "cash":
         return _cash_allocation()
 
-    available = [asset for asset in DEFENSIVE_ASSETS if asset in prices.columns]
+    available = [asset for asset in strategy_config.defensive_assets if asset in prices.columns]
     if not available:
         return _cash_allocation()
 
@@ -823,7 +1264,7 @@ def _apply_allocation_caps(
 ) -> Dict[str, float]:
     capped = allocation.copy()
     if strategy_config.max_single_asset is not None:
-        for asset in RISK_ASSETS:
+        for asset in strategy_config.risk_assets:
             capped[asset] = min(capped[asset], strategy_config.max_single_asset)
 
     if strategy_config.max_crypto_weight is not None:
@@ -910,16 +1351,28 @@ def _date_window(
     return start_i, end_i
 
 
-def _clean_prices(prices: pd.DataFrame) -> pd.DataFrame:
-    missing = [asset for asset in RISK_ASSETS if asset not in prices.columns]
+def _clean_prices(
+    prices: pd.DataFrame,
+    required_assets: Tuple[str, ...] = RISK_ASSETS,
+    asset_scope: Tuple[str, ...] = TRADABLE_ASSETS,
+) -> pd.DataFrame:
+    missing = [asset for asset in required_assets if asset not in prices.columns]
     if missing:
         raise ValueError(f"Missing price columns: {missing}")
-    columns = [asset for asset in TRADABLE_ASSETS if asset in prices.columns]
+    columns = [asset for asset in asset_scope if asset in prices.columns]
     cleaned = prices.loc[:, columns].copy()
     cleaned.index = pd.to_datetime(cleaned.index).normalize()
     cleaned = cleaned.sort_index().dropna()
     cleaned = cleaned[~cleaned.index.duplicated(keep="last")]
     return cleaned
+
+
+def _strategy_price_assets(
+    strategy_config: AllocatorStrategyConfig,
+) -> Tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(strategy_config.risk_assets + strategy_config.defensive_assets)
+    )
 
 
 def _cash_allocation() -> Dict[str, float]:
