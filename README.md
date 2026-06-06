@@ -40,6 +40,9 @@ General spot live trading is blocked unless `USE_TESTNET=false`, `DRY_RUN=false`
 # BTC long/short backtest using the current 10m/4h MTF default
 ./.venv/bin/python main.py --backtest-long-short
 
+# Market regime allocator backtest using public Yahoo/Binance data
+./.venv/bin/python main.py --backtest-allocator
+
 # Observe long/short signals without futures orders
 ./.venv/bin/python main.py --observe-long-short
 

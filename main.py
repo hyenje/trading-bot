@@ -55,6 +55,11 @@ def parse_args():
         help="BTC 롱/숏 전략 백테스팅 실행",
     )
     mode_group.add_argument(
+        "--backtest-allocator",
+        action="store_true",
+        help="시장 Regime Allocator 백테스팅 실행",
+    )
+    mode_group.add_argument(
         "--observe-long-short",
         action="store_true",
         help="BTC 롱/숏 시그널 관찰 대시보드 실행",
@@ -400,6 +405,33 @@ def run_long_short_backtest():
             "\n주의: 기본 MTF 결과는 거래 수가 30건 미만입니다. "
             "testnet 관찰과 더 긴 구간 검증 전에는 생산 전략으로 보지 마세요."
         )
+
+
+def run_allocator_backtest():
+    """시장 Regime Allocator 백테스팅 실행"""
+    from backtesting.market_regime_allocator import (
+        DEFAULT_DAYS,
+        build_allocator_report,
+        fetch_market_regime_prices,
+        format_allocator_report,
+    )
+
+    logger = logging.getLogger(__name__)
+    logger.info("시장 Regime Allocator 백테스팅 시작...")
+    logger.info("백테스트 데이터: Yahoo Finance adjusted close + Binance public OHLCV")
+
+    try:
+        prices = fetch_market_regime_prices(days=DEFAULT_DAYS)
+        report = build_allocator_report(
+            prices,
+            initial_capital=BacktestConfig().initial_capital,
+            days=DEFAULT_DAYS,
+        )
+    except Exception as e:
+        logger.error(f"Allocator 백테스팅 실패: {mask_sensitive(e)}")
+        raise SystemExit(1)
+
+    print(format_allocator_report(report))
 
 
 def _fetch_usdm_ohlcv_history(
@@ -863,6 +895,8 @@ def main():
         raise SystemExit(0 if run_futures_check() else 1)
     elif args.backtest_long_short:
         run_long_short_backtest()
+    elif args.backtest_allocator:
+        run_allocator_backtest()
     elif args.trade_long_short:
         run_long_short_trader()
     elif args.observe_long_short:
