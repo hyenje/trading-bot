@@ -14,6 +14,7 @@ from backtesting.market_regime_allocator import (
     build_rolling_window_rows,
     build_stress_period_rows,
     build_walk_forward_rows,
+    macro_stress_candidate_config,
     run_allocator_backtest,
     select_allocation,
 )
@@ -354,6 +355,31 @@ class MarketRegimeAllocatorTest(unittest.TestCase):
 
         self.assertIn("ETF riskoff defensive", [row["name"] for row in rows])
         self.assertIn("ETF monthly momentum", [row["name"] for row in rows])
+
+    def test_macro_stress_blocks_risk_on_allocation(self):
+        prices = trend_prices_with_defensive(
+            {
+                "SPY": 0.001,
+                "QQQ": 0.002,
+                "BTC": 0.003,
+                "ETH": 0.002,
+                "GLD": 0.001,
+                "TLT": -0.001,
+                "SHY": 0.0001,
+                "BIL": 0.0001,
+            }
+        )
+        prices["VIX"] = 30.0
+
+        allocation, _, risk_on = select_allocation(
+            prices,
+            len(prices) - 1,
+            strategy_config=macro_stress_candidate_config(),
+        )
+
+        self.assertFalse(risk_on)
+        self.assertEqual(allocation["GLD"], 1.0)
+        self.assertEqual(sum(allocation[asset] for asset in RISK_ASSETS), 0.0)
 
 
 if __name__ == "__main__":

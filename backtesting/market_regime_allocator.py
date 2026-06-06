@@ -16,6 +16,8 @@ import requests
 RISK_ASSETS = ("SPY", "QQQ", "BTC", "ETH")
 DEFENSIVE_ASSETS = ("GLD", "TLT", "SHY", "BIL")
 TRADABLE_ASSETS = RISK_ASSETS + DEFENSIVE_ASSETS
+MACRO_ASSETS = ("VIX",)
+PRICE_ASSETS = TRADABLE_ASSETS + MACRO_ASSETS
 ALL_ASSETS = TRADABLE_ASSETS + ("cash",)
 CRYPTO_ASSETS = ("BTC", "ETH")
 DEFAULT_DAYS = 1095
@@ -26,6 +28,10 @@ MOMENTUM_FAST_DAYS = 90
 MOMENTUM_SLOW_DAYS = 180
 SPY_SMA_DAYS = 200
 VOL_LOOKBACK_DAYS = 60
+VIX_STRESS_LEVEL = 25.0
+VIX_STRESS_RATIO = 0.25
+TLT_STRESS_LOOKBACK_DAYS = 90
+TLT_STRESS_RETURN = -0.07
 EXTENDED_ETF_START = "2010-01-01"
 STRESS_PERIODS = (
     ("2018 Q4 risk-off", "2018-09-01", "2018-12-31"),
@@ -48,6 +54,8 @@ class AllocatorStrategyConfig:
     max_crypto_weight: Optional[float] = None
     max_single_asset: Optional[float] = None
     defensive_mode: str = "cash"
+    macro_stress_mode: str = "none"
+    macro_assets: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -128,6 +136,7 @@ def fetch_market_regime_prices(days: int = DEFAULT_DAYS) -> pd.DataFrame:
         "TLT": fetch_yahoo_adjusted_close("TLT", start, end),
         "SHY": fetch_yahoo_adjusted_close("SHY", start, end),
         "BIL": fetch_yahoo_adjusted_close("BIL", start, end),
+        "VIX": fetch_yahoo_adjusted_close("^VIX", start, end),
         "BTC": fetch_binance_daily_close("BTC/USDT", start, end),
         "ETH": fetch_binance_daily_close("ETH/USDT", start, end),
     }
@@ -352,6 +361,10 @@ def select_allocation(
 
     history = prices.iloc[: asof_index + 1]
     scores = _momentum_scores(history, strategy_config)
+    if _is_macro_stressed(history, strategy_config):
+        allocation = _defensive_allocation(history, strategy_config)
+        return allocation, scores, False
+
     risk_on = _is_risk_on(history, strategy_config)
     if not risk_on:
         allocation = _defensive_allocation(history, strategy_config)
@@ -554,7 +567,7 @@ def format_allocator_report(report: AllocatorReport) -> str:
         ),
         (
             "Sources: Yahoo Finance adjusted close "
-            "(SPY/QQQ/GLD/TLT/SHY/BIL), Binance public daily OHLCV (BTC/ETH)"
+            "(SPY/QQQ/GLD/TLT/SHY/BIL/VIX), Binance public daily OHLCV (BTC/ETH)"
         ),
         "Rules: weekly rebalance, SPY > 200d SMA risk-on, score=0.6*90d+0.4*180d",
         f"Cost: {REBALANCE_FEE_RATE * 100:.2f}% on changed risky notional",
@@ -707,6 +720,18 @@ def build_candidate_benchmark_rows(
             start_date=start_date,
             strategy_config=riskoff_defensive_candidate_config(),
         ),
+        run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            strategy_config=tlt_stress_candidate_config(),
+        ),
+        run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            strategy_config=vix_tlt_stress_candidate_config(),
+        ),
         run_buy_hold(prices, "SPY", initial_capital, start_date=start_date),
         run_buy_hold(prices, "QQQ", initial_capital, start_date=start_date),
         run_buy_hold(prices, "BTC", initial_capital, start_date=start_date),
@@ -745,6 +770,20 @@ def build_stress_period_rows(
             end_date=end_date,
             strategy_config=riskoff_defensive_candidate_config(),
         )
+        macro_candidate = run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_config=tlt_stress_candidate_config(),
+        )
+        vix_tlt_candidate = run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_config=macro_stress_candidate_config(),
+        )
         spy = run_buy_hold(
             prices,
             "SPY",
@@ -768,17 +807,24 @@ def build_stress_period_rows(
             end_date=end_date,
         )
         candidate_metric = calculate_metrics(candidate)
+        macro_metric = calculate_metrics(macro_candidate)
+        vix_tlt_metric = calculate_metrics(vix_tlt_candidate)
         rows.append(
             {
                 "label": label,
                 "start": candidate.start_date.date().isoformat(),
                 "end": candidate.end_date.date().isoformat(),
                 "candidate": candidate_metric.total_return_pct,
+                "macro_candidate": macro_metric.total_return_pct,
+                "vix_tlt_candidate": vix_tlt_metric.total_return_pct,
                 "spy": calculate_metrics(spy).total_return_pct,
                 "btc": calculate_metrics(btc).total_return_pct,
                 "sixty_forty": calculate_metrics(sixty_forty).total_return_pct,
                 "candidate_maxdd": candidate_metric.max_drawdown_pct,
+                "macro_maxdd": macro_metric.max_drawdown_pct,
+                "vix_tlt_maxdd": vix_tlt_metric.max_drawdown_pct,
                 "candidate_sharpe": candidate_metric.sharpe,
+                "macro_sharpe": macro_metric.sharpe,
             }
         )
     return rows
@@ -803,6 +849,20 @@ def build_walk_forward_rows(
             start_date=start_date,
             end_date=end_date,
             strategy_config=riskoff_defensive_candidate_config(),
+        )
+        macro_candidate = run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_config=tlt_stress_candidate_config(),
+        )
+        vix_tlt_candidate = run_allocator_backtest(
+            prices,
+            initial_capital,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_config=macro_stress_candidate_config(),
         )
         if len(candidate.equity_curve) < 20:
             continue
@@ -829,6 +889,8 @@ def build_walk_forward_rows(
             end_date=end_date,
         )
         candidate_metric = calculate_metrics(candidate)
+        macro_metric = calculate_metrics(macro_candidate)
+        vix_tlt_metric = calculate_metrics(vix_tlt_candidate)
         spy_total = calculate_metrics(spy).total_return_pct
         rows.append(
             {
@@ -836,11 +898,17 @@ def build_walk_forward_rows(
                 "start": candidate.start_date.date().isoformat(),
                 "end": candidate.end_date.date().isoformat(),
                 "candidate": candidate_metric.total_return_pct,
+                "macro_candidate": macro_metric.total_return_pct,
+                "vix_tlt_candidate": vix_tlt_metric.total_return_pct,
                 "spy": spy_total,
                 "btc": calculate_metrics(btc).total_return_pct,
                 "sixty_forty": calculate_metrics(sixty_forty).total_return_pct,
                 "vs_spy": candidate_metric.total_return_pct - spy_total,
+                "macro_vs_spy": macro_metric.total_return_pct - spy_total,
+                "vix_tlt_vs_spy": vix_tlt_metric.total_return_pct - spy_total,
                 "candidate_maxdd": candidate_metric.max_drawdown_pct,
+                "macro_maxdd": macro_metric.max_drawdown_pct,
+                "vix_tlt_maxdd": vix_tlt_metric.max_drawdown_pct,
             }
         )
     return rows
@@ -973,6 +1041,29 @@ def riskoff_defensive_candidate_config() -> AllocatorStrategyConfig:
     )
 
 
+def macro_stress_candidate_config() -> AllocatorStrategyConfig:
+    return vix_tlt_stress_candidate_config()
+
+
+def tlt_stress_candidate_config() -> AllocatorStrategyConfig:
+    return AllocatorStrategyConfig(
+        name="tlt stress riskoff",
+        score_mode="vol_adjusted",
+        defensive_mode="top1",
+        macro_stress_mode="tlt",
+    )
+
+
+def vix_tlt_stress_candidate_config() -> AllocatorStrategyConfig:
+    return AllocatorStrategyConfig(
+        name="vix+tlt stress riskoff",
+        score_mode="vol_adjusted",
+        defensive_mode="top1",
+        macro_stress_mode="vix_tlt",
+        macro_assets=MACRO_ASSETS,
+    )
+
+
 def monthly_momentum_config() -> AllocatorStrategyConfig:
     return AllocatorStrategyConfig(
         name="simple monthly momentum",
@@ -1073,7 +1164,7 @@ def _format_stress_period_rows(rows: List[Dict[str, float]]) -> List[str]:
     lines = [
         "",
         "--- Stress Regimes ---",
-        "period                  window                  candidate    SPY    BTC  60/40  candDD Sharpe",
+        "period                  window                    base     tlt vix+tlt    SPY    BTC  60/40  baseDD  tltDD vixDD",
     ]
     if not rows:
         lines.append("not enough data")
@@ -1083,12 +1174,15 @@ def _format_stress_period_rows(rows: List[Dict[str, float]]) -> List[str]:
         lines.append(
             f"{row['label'][:22]:<22} "
             f"{window:<22} "
-            f"{row['candidate']:>9.2f} "
+            f"{row['candidate']:>7.2f} "
+            f"{row['macro_candidate']:>7.2f} "
+            f"{row['vix_tlt_candidate']:>7.2f} "
             f"{row['spy']:>6.2f} "
             f"{row['btc']:>6.2f} "
             f"{row['sixty_forty']:>6.2f} "
             f"{row['candidate_maxdd']:>7.2f} "
-            f"{row['candidate_sharpe']:>6.2f}"
+            f"{row['macro_maxdd']:>6.2f} "
+            f"{row['vix_tlt_maxdd']:>5.2f}"
         )
     return lines
 
@@ -1097,7 +1191,7 @@ def _format_walk_forward_rows(rows: List[Dict[str, float]]) -> List[str]:
     lines = [
         "",
         "--- Fixed-Parameter Walk-Forward ---",
-        "year window                  candidate    SPY    BTC  60/40   vsSPY  candDD",
+        "year window                    base     tlt vix+tlt    SPY    BTC  60/40 baseVs tltVs vixVs baseDD tltDD vixDD",
     ]
     if not rows:
         lines.append("not enough data")
@@ -1107,12 +1201,18 @@ def _format_walk_forward_rows(rows: List[Dict[str, float]]) -> List[str]:
         lines.append(
             f"{int(row['year']):>4d} "
             f"{window:<22} "
-            f"{row['candidate']:>9.2f} "
+            f"{row['candidate']:>7.2f} "
+            f"{row['macro_candidate']:>7.2f} "
+            f"{row['vix_tlt_candidate']:>7.2f} "
             f"{row['spy']:>6.2f} "
             f"{row['btc']:>6.2f} "
             f"{row['sixty_forty']:>6.2f} "
             f"{row['vs_spy']:>7.2f} "
-            f"{row['candidate_maxdd']:>7.2f}"
+            f"{row['macro_vs_spy']:>5.2f} "
+            f"{row['vix_tlt_vs_spy']:>5.2f} "
+            f"{row['candidate_maxdd']:>7.2f} "
+            f"{row['macro_maxdd']:>5.2f} "
+            f"{row['vix_tlt_maxdd']:>5.2f}"
         )
     return lines
 
@@ -1177,6 +1277,41 @@ def _is_risk_on(
             >= 3
         )
     return _above_sma(prices, "SPY")
+
+
+def _is_macro_stressed(
+    prices: pd.DataFrame,
+    strategy_config: AllocatorStrategyConfig,
+) -> bool:
+    if strategy_config.macro_stress_mode not in ("vix", "tlt", "vix_tlt"):
+        return False
+
+    if (
+        strategy_config.macro_stress_mode in ("vix", "vix_tlt")
+        and "VIX" in prices.columns
+        and len(prices) >= 20
+    ):
+        vix = float(prices["VIX"].iloc[-1])
+        vix_sma = float(prices["VIX"].iloc[-20:].mean())
+        if vix >= VIX_STRESS_LEVEL:
+            return True
+        if vix_sma > 0 and vix / vix_sma - 1 >= VIX_STRESS_RATIO:
+            return True
+
+    if (
+        strategy_config.macro_stress_mode in ("tlt", "vix_tlt")
+        and "TLT" in prices.columns
+        and len(prices) > TLT_STRESS_LOOKBACK_DAYS
+    ):
+        tlt_return = (
+            float(prices["TLT"].iloc[-1])
+            / float(prices["TLT"].iloc[-(TLT_STRESS_LOOKBACK_DAYS + 1)])
+            - 1
+        )
+        if tlt_return <= TLT_STRESS_RETURN and not _above_sma(prices, "TLT"):
+            return True
+
+    return False
 
 
 def _is_asset_eligible(
@@ -1354,7 +1489,7 @@ def _date_window(
 def _clean_prices(
     prices: pd.DataFrame,
     required_assets: Tuple[str, ...] = RISK_ASSETS,
-    asset_scope: Tuple[str, ...] = TRADABLE_ASSETS,
+    asset_scope: Tuple[str, ...] = PRICE_ASSETS,
 ) -> pd.DataFrame:
     missing = [asset for asset in required_assets if asset not in prices.columns]
     if missing:
@@ -1371,7 +1506,11 @@ def _strategy_price_assets(
     strategy_config: AllocatorStrategyConfig,
 ) -> Tuple[str, ...]:
     return tuple(
-        dict.fromkeys(strategy_config.risk_assets + strategy_config.defensive_assets)
+        dict.fromkeys(
+            strategy_config.risk_assets
+            + strategy_config.defensive_assets
+            + strategy_config.macro_assets
+        )
     )
 
 
