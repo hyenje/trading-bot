@@ -43,6 +43,9 @@ General spot live trading is blocked unless `USE_TESTNET=false`, `DRY_RUN=false`
 # Market regime allocator backtest using public Yahoo/Binance data
 ./.venv/bin/python main.py --backtest-allocator
 
+# Market regime allocator backtest from a fixed start date
+./.venv/bin/python main.py --backtest-allocator --allocator-start-date 2019-09-08
+
 # Current TLT-stress allocator target allocation
 ./.venv/bin/python main.py --allocator-signal
 
@@ -102,6 +105,16 @@ No extra test dependency is required.
 ```
 
 ## Current Backtest Limits
+
+The allocator is the active research candidate for paper/live observation. It
+is still signal-only in this repo: `--backtest-allocator`, `--allocator-signal`,
+and `--observe-allocator` use public market data and do not submit orders. Use
+`--allocator-start-date YYYY-MM-DD` to pin a validation window, for example the
+available BTCUSDT futures era beginning around September 2019.
+
+The allocator report includes candidate benchmarks, crypto-cap and monthly
+rebalance variants, rolling-window stability, stress-period rows, walk-forward
+checks, and fee-stress rows at 0.10%, 0.20%, 0.50%, and 1.00% rebalance costs.
 
 The long/short backtest uses `LONG_SHORT_ORDER_USDT` as fixed notional sizing
 and prints the current `10m/4h fee-aware reverse` strategy first, with the old

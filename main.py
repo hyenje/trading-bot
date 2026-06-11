@@ -11,7 +11,7 @@ Crypto Trading Bot - 메인 실행 스크립트
 import argparse
 import threading
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from utils.logger import setup_logger
@@ -85,6 +85,11 @@ def parse_args():
         help="Binance Futures 테스트넷 설정/API 점검",
     )
     mode_group.add_argument("--check", action="store_true", help="설정/API 점검")
+    parser.add_argument(
+        "--allocator-start-date",
+        default=None,
+        help="Allocator 백테스트 시작일 (YYYY-MM-DD, --backtest-allocator 전용)",
+    )
     return parser.parse_args()
 
 
@@ -438,7 +443,7 @@ def run_long_short_backtest():
         )
 
 
-def run_allocator_backtest():
+def run_allocator_backtest(start_date: Optional[str] = None):
     """시장 Regime Allocator 백테스팅 실행"""
     from backtesting.market_regime_allocator import (
         DEFAULT_DAYS,
@@ -454,12 +459,25 @@ def run_allocator_backtest():
     logger.info("백테스트 데이터: Yahoo Finance adjusted close + Binance public OHLCV")
 
     try:
-        validation_prices = fetch_market_regime_prices(days=EXTENDED_VALIDATION_DAYS)
+        fetch_days = EXTENDED_VALIDATION_DAYS
+        if start_date:
+            requested_start = _parse_allocator_start_date(start_date)
+            fetch_days = max(
+                EXTENDED_VALIDATION_DAYS,
+                (datetime.utcnow().date() - requested_start).days + 5,
+            )
+
+        validation_prices = fetch_market_regime_prices(days=fetch_days)
         extended_etf_prices = fetch_extended_etf_prices()
+        report_days = _allocator_report_days(
+            start_date,
+            validation_prices.index[-1],
+            DEFAULT_DAYS,
+        )
         report = build_allocator_report(
             validation_prices,
             initial_capital=BacktestConfig().initial_capital,
-            days=DEFAULT_DAYS,
+            days=report_days,
             extended_etf_prices=extended_etf_prices,
         )
     except Exception as e:
@@ -467,6 +485,29 @@ def run_allocator_backtest():
         raise SystemExit(1)
 
     print(format_allocator_report(report))
+
+
+def _parse_allocator_start_date(value: str) -> date:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError("allocator start date must use YYYY-MM-DD") from None
+
+
+def _allocator_report_days(
+    start_date: Optional[str],
+    latest_date,
+    default_days: int,
+) -> int:
+    if not start_date:
+        return default_days
+
+    start = _parse_allocator_start_date(start_date)
+    latest = latest_date.date() if hasattr(latest_date, "date") else latest_date
+    days = (latest - start).days
+    if days <= 0:
+        raise ValueError("allocator start date must be before the latest price date")
+    return days
 
 
 def _fetch_usdm_ohlcv_history(
@@ -931,7 +972,7 @@ def main():
     elif args.backtest_long_short:
         run_long_short_backtest()
     elif args.backtest_allocator:
-        run_allocator_backtest()
+        run_allocator_backtest(args.allocator_start_date)
     elif args.allocator_signal:
         run_allocator_signal()
     elif args.observe_allocator:

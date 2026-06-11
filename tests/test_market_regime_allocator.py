@@ -12,6 +12,7 @@ from backtesting.market_regime_allocator import (
     build_current_allocator_signal,
     build_extended_etf_rows,
     build_experiment_rows,
+    build_fee_stress_rows,
     build_rolling_window_rows,
     build_stress_period_rows,
     build_walk_forward_rows,
@@ -336,6 +337,27 @@ class MarketRegimeAllocatorTest(unittest.TestCase):
         self.assertIn("simple monthly momentum", [row["name"] for row in benchmark_rows])
         self.assertTrue(any(row["label"] == "2020 COVID crash" for row in stress_rows))
         self.assertTrue(any(row["year"] == 2022 for row in walk_forward_rows))
+
+    def test_fee_stress_rows_include_realistic_cost_levels(self):
+        prices = trend_prices_with_defensive(
+            {
+                "SPY": 0.0005,
+                "QQQ": 0.0007,
+                "BTC": 0.001,
+                "ETH": 0.0008,
+                "GLD": 0.0003,
+                "TLT": 0.0001,
+                "SHY": 0.0001,
+                "BIL": 0.0001,
+            },
+            rows=620,
+        )
+
+        rows = build_fee_stress_rows(prices, initial_capital=10000.0, days=120)
+
+        self.assertEqual([row["fee_rate"] for row in rows], [0.001, 0.002, 0.005, 0.01])
+        self.assertTrue(all("total" in row and "cost" in row for row in rows))
+        self.assertTrue(all(row["cost"] >= 0.0 for row in rows))
 
     def test_extended_etf_rows_do_not_require_crypto_prices(self):
         prices = trend_prices_with_defensive(

@@ -120,6 +120,7 @@ class AllocatorReport:
     recent_experiment_rows: List[Dict[str, float]] = field(default_factory=list)
     rolling_window_rows: List[Dict[str, float]] = field(default_factory=list)
     candidate_benchmark_rows: List[Dict[str, float]] = field(default_factory=list)
+    fee_stress_rows: List[Dict[str, float]] = field(default_factory=list)
     stress_period_rows: List[Dict[str, float]] = field(default_factory=list)
     walk_forward_rows: List[Dict[str, float]] = field(default_factory=list)
     extended_etf_rows: List[Dict[str, float]] = field(default_factory=list)
@@ -558,6 +559,11 @@ def build_allocator_report(
             initial_capital,
             days,
         ),
+        fee_stress_rows=build_fee_stress_rows(
+            prices,
+            initial_capital,
+            days,
+        ),
         stress_period_rows=build_stress_period_rows(prices, initial_capital),
         walk_forward_rows=build_walk_forward_rows(prices, initial_capital),
         extended_etf_rows=build_extended_etf_rows(
@@ -692,6 +698,7 @@ def format_allocator_report(report: AllocatorReport) -> str:
     lines.extend(
         _format_candidate_benchmark_rows(report.candidate_benchmark_rows)
     )
+    lines.extend(_format_fee_stress_rows(report.fee_stress_rows))
     lines.extend(_format_stress_period_rows(report.stress_period_rows))
     lines.extend(_format_walk_forward_rows(report.walk_forward_rows))
     lines.extend(_format_extended_etf_rows(report.extended_etf_rows))
@@ -810,6 +817,39 @@ def build_candidate_benchmark_rows(
         ),
     ]
     return [_metric_row(result) for result in results]
+
+
+def build_fee_stress_rows(
+    prices: pd.DataFrame,
+    initial_capital: float,
+    days: int,
+    fee_rates: Tuple[float, ...] = (0.001, 0.002, 0.005, 0.01),
+) -> List[Dict[str, float]]:
+    prices = _clean_prices(prices)
+    start_date = prices.index[-1] - pd.Timedelta(days=days)
+    rows = []
+    for fee_rate in fee_rates:
+        result = run_allocator_backtest(
+            prices,
+            initial_capital,
+            fee_rate=fee_rate,
+            start_date=start_date,
+            strategy_config=tlt_stress_candidate_config(),
+        )
+        metric = calculate_metrics(result)
+        rows.append(
+            {
+                "fee_rate": fee_rate,
+                "total": metric.total_return_pct,
+                "cagr": metric.cagr_pct,
+                "maxdd": metric.max_drawdown_pct,
+                "sharpe": metric.sharpe,
+                "final_eq": metric.final_equity,
+                "turnover": metric.turnover,
+                "cost": result.total_cost,
+            }
+        )
+    return rows
 
 
 def build_stress_period_rows(
@@ -1217,6 +1257,29 @@ def _format_candidate_benchmark_rows(rows: List[Dict[str, float]]) -> List[str]:
             f"{row['maxdd']:>7.2f} "
             f"{row['sharpe']:>7.2f} "
             f"{row['final_eq']:>8.2f}"
+        )
+    return lines
+
+
+def _format_fee_stress_rows(rows: List[Dict[str, float]]) -> List[str]:
+    lines = [
+        "",
+        "--- Allocator Fee Stress ---",
+        "fee      total%   CAGR%   maxDD%  Sharpe final_eq turnover cost",
+    ]
+    if not rows:
+        lines.append("not enough data")
+        return lines
+    for row in rows:
+        lines.append(
+            f"{row['fee_rate'] * 100:>5.2f}% "
+            f"{row['total']:>7.2f} "
+            f"{row['cagr']:>7.2f} "
+            f"{row['maxdd']:>7.2f} "
+            f"{row['sharpe']:>7.2f} "
+            f"{row['final_eq']:>8.2f} "
+            f"{row['turnover']:>7.2f}x "
+            f"{row['cost']:>5.0f}"
         )
     return lines
 
